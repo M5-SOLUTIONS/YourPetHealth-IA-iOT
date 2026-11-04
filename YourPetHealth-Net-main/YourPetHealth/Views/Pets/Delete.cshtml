@@ -1,0 +1,64 @@
+@model YourPetHealth.Models.Pet
+
+@{
+    ViewData["Title"] = "Excluir pet";
+}
+
+<div class="crumb">
+    <a asp-action="Index">Pets</a>
+    <span class="sep">/</span>
+    <a asp-action="Details" asp-route-id="@Model.Id">@Model.Nome</a>
+    <span class="sep">/</span>
+    <span>Excluir</span>
+</div>
+
+<div class="form-shell">
+    <div class="form-card-header">
+        <h1><i class="fa-solid fa-trash"></i> Excluir pet</h1>
+        <p>Confirme se deseja remover @Model.Nome</p>
+    </div>
+
+    <div class="form-panel">
+        <div class="alert alert-danger mb-4">
+            <i class="fa-solid fa-triangle-exclamation me-1"></i>
+            <strong>Atenção:</strong> esta ação não pode ser desfeita.
+        </div>
+
+        <div class="detail-grid mb-4">
+            <div class="detail-item">
+                <div class="label">Nome</div>
+                <div class="value">@Model.Nome</div>
+            </div>
+            <div class="detail-item">
+                <div class="label">Raça</div>
+                <div class="value">@(Model.Raca ?? "—")</div>
+            </div>
+            <div class="detail-item">
+                <div class="label">Idade</div>
+                <div class="value">@(Model.Idade?.ToString() ?? "—") anos</div>
+            </div>
+            <div class="detail-item">
+                <div class="label">Peso</div>
+                <div class="value">@(Model.Peso?.ToString("0.##") ?? "—") kg</div>
+            </div>
+            <div class="detail-item">
+                <div class="label">Sexo</div>
+                <div class="value">@Model.Sexo</div>
+            </div>
+            <div class="detail-item">
+                <div class="label">Tutor</div>
+                <div class="value">@(Model.Responsavel?.Nome ?? "—")</div>
+            </div>
+        </div>
+
+        <form asp-action="Delete" method="post">
+            <input type="hidden" asp-for="Id" />
+            <div class="form-actions">
+                <button type="submit" class="btn btn-danger-soft">
+                    <i class="fa-solid fa-trash"></i> Sim, excluir pet
+                </button>
+                <a asp-action="Details" asp-route-id="@Model.Id" class="btn btn-secondary">Cancelar</a>
+            </div>
+        </form>
+    </div>
+</div>

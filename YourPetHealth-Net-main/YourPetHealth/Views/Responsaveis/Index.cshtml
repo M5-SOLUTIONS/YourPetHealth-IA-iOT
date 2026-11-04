@@ -1,0 +1,55 @@
+@model IEnumerable<YourPetHealth.Models.Responsavel>
+
+@{
+    ViewData["Title"] = "Responsáveis";
+}
+
+<div class="page-header">
+    <div>
+        <h1 class="page-title"><i class="fa-solid fa-users"></i> Responsáveis</h1>
+        <p class="page-subtitle">Tutores dos pets cadastrados</p>
+    </div>
+    <div class="page-actions">
+        <a asp-action="Create" class="btn btn-primary">
+            <i class="fa-solid fa-plus"></i> Novo responsável
+        </a>
+    </div>
+</div>
+
+@if (!Model.Any())
+{
+    <div class="empty-state">
+        <div class="empty-icon"><i class="fa-solid fa-users"></i></div>
+        <p>Nenhum responsável cadastrado.</p>
+        <a asp-action="Create" class="btn btn-primary">Cadastrar o primeiro</a>
+    </div>
+}
+else
+{
+    <div class="table-card">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>Nome</th>
+                    <th>E-mail</th>
+                    <th>Telefone</th>
+                    <th class="text-end">Ações</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var item in Model)
+                {
+                    <tr>
+                        <td><strong>@item.Nome</strong></td>
+                        <td>@item.Email</td>
+                        <td>@item.Telefone</td>
+                        <td class="text-end">
+                            <a asp-action="Edit" asp-route-id="@item.Id" class="btn btn-sm btn-outline-secondary">Editar</a>
+                            <a asp-action="Delete" asp-route-id="@item.Id" class="btn btn-sm btn-outline-secondary">Excluir</a>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}

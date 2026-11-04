@@ -1,0 +1,65 @@
+@model IEnumerable<YourPetHealth.Models.Pet>
+
+@{
+    ViewData["Title"] = User.IsInRole("RESPONSAVEL") ? "Meus Pets" : "Pets";
+}
+
+<div class="page-header">
+    <div>
+        <h1 class="page-title"><i class="fa-solid fa-paw"></i> @ViewData["Title"]</h1>
+        <p class="page-subtitle">Gerencie os animais cadastrados</p>
+    </div>
+    <div class="page-actions">
+        @if (User.IsInRole("RESPONSAVEL") || User.IsInRole("ADMIN"))
+        {
+            <a asp-action="Create" class="btn btn-primary">
+                <i class="fa-solid fa-plus"></i> Novo pet
+            </a>
+        }
+    </div>
+</div>
+
+@if (TempData["Sucesso"] != null)
+{
+    <div class="alert alert-success mb-3">@TempData["Sucesso"]</div>
+}
+
+@if (!Model.Any())
+{
+    <div class="empty-state">
+        <div class="empty-icon"><i class="fa-solid fa-paw"></i></div>
+        <p>Nenhum pet cadastrado ainda.</p>
+        @if (User.IsInRole("RESPONSAVEL") || User.IsInRole("ADMIN"))
+        {
+            <a asp-action="Create" class="btn btn-primary">Cadastrar o primeiro pet</a>
+        }
+    </div>
+}
+else
+{
+    <div class="row g-3">
+        @foreach (var pet in Model)
+        {
+            <div class="col-md-4 col-sm-6">
+                <a asp-action="Details" asp-route-id="@pet.Id" class="text-decoration-none text-reset d-block h-100">
+                    <div class="card pet-card h-100">
+                        <div class="card-body">
+                            <div class="d-flex justify-content-between align-items-start mb-2">
+                                <h5 class="card-title mb-0">@pet.Nome</h5>
+                                <span class="badge badge-sexo">@pet.Sexo</span>
+                            </div>
+                            <p class="card-text text-muted mb-0 small">
+                                <strong>Raça:</strong> @pet.Raca<br />
+                                <strong>Idade:</strong> @pet.Idade anos
+                                @if (!User.IsInRole("RESPONSAVEL"))
+                                {
+                                    <br /><strong>Tutor:</strong> @(pet.Responsavel?.Nome ?? "—")
+                                }
+                            </p>
+                        </div>
+                    </div>
+                </a>
+            </div>
+        }
+    </div>
+}

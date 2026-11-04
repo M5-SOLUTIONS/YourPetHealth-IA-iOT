@@ -1,0 +1,60 @@
+@model YourPetHealth.Models.HistoricoClinico
+
+@{
+    ViewData["Title"] = "Editar histórico";
+}
+
+<div class="crumb">
+    <a asp-action="Index">Histórico clínico</a>
+    <span class="sep">/</span>
+    <span>Editar</span>
+</div>
+
+<div class="form-shell">
+    <div class="form-card-header">
+        <h1><i class="fa-solid fa-pen"></i> Editar registro</h1>
+        <p>Atualize o histórico clínico</p>
+    </div>
+
+    <div class="form-panel">
+        <form asp-action="Edit" method="post">
+            <div asp-validation-summary="ModelOnly" class="text-danger mb-3"></div>
+            <input type="hidden" asp-for="Id" />
+
+            <div class="form-group">
+                <label asp-for="PetId">Pet</label>
+                <select asp-for="PetId" asp-items="ViewBag.PetId" class="form-select"></select>
+                <span asp-validation-for="PetId" class="text-danger small"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="Tipo">Tipo</label>
+                <input asp-for="Tipo" class="form-control" />
+                <span asp-validation-for="Tipo" class="text-danger small"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="Descricao">Descrição</label>
+                <textarea asp-for="Descricao" rows="3" class="form-control"></textarea>
+                <span asp-validation-for="Descricao" class="text-danger small"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="Data">Data</label>
+                <input asp-for="Data" type="date" class="form-control" />
+                <span asp-validation-for="Data" class="text-danger small"></span>
+            </div>
+
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary">
+                    <i class="fa-solid fa-check"></i> Salvar alterações
+                </button>
+                <a asp-action="Index" class="btn btn-secondary">Cancelar</a>
+            </div>
+        </form>
+    </div>
+</div>
+
+@section Scripts {
+    <partial name="_ValidationScriptsPartial" />
+}

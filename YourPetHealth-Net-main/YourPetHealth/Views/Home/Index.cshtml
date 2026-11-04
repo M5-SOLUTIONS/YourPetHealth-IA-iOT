@@ -1,0 +1,77 @@
+@{
+    ViewData["Title"] = "Dashboard";
+}
+
+<div class="hero">
+    <h1><span class="emoji">🐾</span> Bem-vindo ao YourPetHealth</h1>
+    <p>Central de gestão da saúde animal</p>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-icon"><i class="fa-solid fa-users"></i></div>
+        <div class="stat-label">Responsáveis</div>
+        <div class="stat-value">@ViewBag.TotalResponsaveis</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon"><i class="fa-solid fa-user-doctor"></i></div>
+        <div class="stat-label">Veterinários</div>
+        <div class="stat-value">@ViewBag.TotalVeterinarios</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon"><i class="fa-solid fa-paw"></i></div>
+        <div class="stat-label">Pets</div>
+        <div class="stat-value">@ViewBag.TotalPets</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon"><i class="fa-solid fa-calendar-check"></i></div>
+        <div class="stat-label">Consultas</div>
+        <div class="stat-value">@ViewBag.TotalConsultas</div>
+    </div>
+</div>
+
+<div class="section-block">
+    <div class="card">
+        <div class="card-header d-flex align-items-center gap-2">
+            <i class="fa-solid fa-clock text-danger"></i>
+            <span>Consultas agendadas (@ViewBag.ConsultasAgendadas)</span>
+        </div>
+        <div class="card-body">
+            @if (ViewBag.ConsultasAgendadas > 0)
+            {
+                <div class="alert alert-info mb-0">
+                    <i class="fa-solid fa-circle-info me-1"></i>
+                    Você tem <strong>@ViewBag.ConsultasAgendadas</strong> consulta(s) agendada(s) para os próximos dias.
+                </div>
+            }
+            else
+            {
+                <p class="text-muted text-center mb-0 py-3">Nenhuma consulta agendada no momento.</p>
+            }
+        </div>
+    </div>
+</div>
+
+<div class="section-block">
+    <div class="section-title">
+        <h2>Acesso rápido</h2>
+    </div>
+    <div class="quick-grid">
+        <a href="/Responsaveis" class="quick-btn">
+            <i class="fa-solid fa-users"></i>
+            Responsáveis
+        </a>
+        <a href="/Veterinarios" class="quick-btn">
+            <i class="fa-solid fa-user-doctor"></i>
+            Veterinários
+        </a>
+        <a href="/Pets" class="quick-btn">
+            <i class="fa-solid fa-paw"></i>
+            Pets
+        </a>
+        <a href="/Consultas" class="quick-btn">
+            <i class="fa-solid fa-calendar-alt"></i>
+            Consultas
+        </a>
+    </div>
+</div>

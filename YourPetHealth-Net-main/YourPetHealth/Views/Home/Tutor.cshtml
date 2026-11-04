@@ -1,0 +1,76 @@
+@using YourPetHealth.Models
+@{
+    ViewData["Title"] = "Início";
+    var meusPets = ViewBag.MeusPets as List<Pet> ?? new List<Pet>();
+    var proximasConsultas = ViewBag.ProximasConsultas as List<Consulta> ?? new List<Consulta>();
+}
+
+<div class="container">
+    <h1 class="mb-4">Olá, @User.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value</h1>
+
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-label">Pets cadastrados</div>
+            <div class="stat-value">@meusPets.Count</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Consultas nas próximas 48 horas</div>
+            <div class="stat-value">@ViewBag.ConsultasProximas48h</div>
+        </div>
+    </div>
+
+    <div class="section-title">
+        <h2>Próximas consultas</h2>
+        <a asp-controller="Consultas" asp-action="Index" class="btn btn-outline-secondary btn-sm">Ver todas</a>
+    </div>
+
+    @if (proximasConsultas.Count == 0)
+    {
+        <div class="empty-state card">
+            <p>Nenhuma consulta agendada.</p>
+            <a asp-controller="Consultas" asp-action="Create" class="btn btn-primary">Agendar consulta</a>
+        </div>
+    }
+    else
+    {
+        foreach (var c in proximasConsultas)
+        {
+            <div class="list-row">
+                <div>
+                    <strong>@c.Pet?.Nome</strong>
+                    <div class="text-muted small">@c.Veterinario?.Nome &middot; @c.Data.ToString("dd/MM/yyyy 'às' HH:mm")</div>
+                </div>
+                <span class="badge badge-tipo">@c.Tipo</span>
+            </div>
+        }
+    }
+
+    <div class="section-title">
+        <h2>Seus pets</h2>
+        <a asp-controller="Pets" asp-action="Index" class="btn btn-outline-secondary btn-sm">Ver todos</a>
+    </div>
+
+    @if (meusPets.Count == 0)
+    {
+        <div class="empty-state card">
+            <p>Você ainda não cadastrou nenhum pet.</p>
+            <a asp-controller="Pets" asp-action="Create" class="btn btn-primary">Cadastrar pet</a>
+        </div>
+    }
+    else
+    {
+        <div class="row">
+            @foreach (var pet in meusPets.Take(4))
+            {
+                <div class="col-md-3 mb-3">
+                    <a href="/Pets/Details/@pet.Id" class="text-decoration-none text-reset">
+                        <div class="card p-3 h-100">
+                            <strong>@pet.Nome</strong>
+                            <span class="text-muted small">@pet.Raca</span>
+                        </div>
+                    </a>
+                </div>
+            }
+        </div>
+    }
+</div>

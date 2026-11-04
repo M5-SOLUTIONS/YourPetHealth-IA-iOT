@@ -1,0 +1,76 @@
+@model YourPetHealth.Models.Veterinario
+
+@{
+    ViewData["Title"] = "Novo veterinário";
+}
+
+<div class="crumb">
+    <a asp-action="Index">Veterinários</a>
+    <span class="sep">/</span>
+    <span>Novo</span>
+</div>
+
+<div class="form-shell">
+    <div class="form-card-header">
+        <h1><i class="fa-solid fa-user-doctor"></i> Novo veterinário</h1>
+        <p>Cadastre um profissional da clínica</p>
+    </div>
+
+    <div class="form-panel">
+        <form asp-action="Create" method="post">
+            <div asp-validation-summary="ModelOnly" class="text-danger mb-3"></div>
+
+            <div class="form-group">
+                <label asp-for="Nome">Nome completo</label>
+                <input asp-for="Nome" class="form-control" />
+                <span asp-validation-for="Nome" class="text-danger small"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="Email">E-mail</label>
+                <input asp-for="Email" type="email" class="form-control" />
+                <span asp-validation-for="Email" class="text-danger small"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="Senha">Senha</label>
+                <input asp-for="Senha" type="password" class="form-control" />
+                <span asp-validation-for="Senha" class="text-danger small"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="Telefone">Telefone</label>
+                <input asp-for="Telefone" class="form-control" />
+                <span asp-validation-for="Telefone" class="text-danger small"></span>
+            </div>
+
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <div class="form-group mb-0">
+                        <label asp-for="Crmv">CRMV</label>
+                        <input asp-for="Crmv" class="form-control" />
+                        <span asp-validation-for="Crmv" class="text-danger small"></span>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="form-group mb-0">
+                        <label asp-for="Especialidade">Especialidade</label>
+                        <input asp-for="Especialidade" class="form-control" placeholder="Clínica Geral, Cirurgia..." />
+                        <span asp-validation-for="Especialidade" class="text-danger small"></span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="form-actions mt-4">
+                <button type="submit" class="btn btn-primary">
+                    <i class="fa-solid fa-check"></i> Cadastrar
+                </button>
+                <a asp-action="Index" class="btn btn-secondary">Cancelar</a>
+            </div>
+        </form>
+    </div>
+</div>
+
+@section Scripts {
+    <partial name="_ValidationScriptsPartial" />
+}

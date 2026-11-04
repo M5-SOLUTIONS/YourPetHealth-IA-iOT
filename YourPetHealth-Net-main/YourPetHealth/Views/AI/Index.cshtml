@@ -1,0 +1,171 @@
+﻿@{
+    ViewData["Title"] = "Assistente IA e Telemetria";
+}
+
+<div class="hero mb-4">
+    <h1><span class="emoji">🤖</span> Assistente IA Veterinária</h1>
+    <p>Análise inteligente de sintomas integrada com telemetria MongoDB</p>
+</div>
+
+
+<div class="section-block">
+    <div class="card shadow-sm border-success">
+        <div class="card-header bg-success text-white d-flex align-items-center gap-2">
+            <i class="fa-solid fa-robot"></i>
+            <span>Assistente IA Veterinária (Com Consulta de Telemetria)</span>
+        </div>
+        <div class="card-body">
+            <form id="formChatIa" onsubmit="enviarMensagemIa(event)">
+                <div class="row g-3 mb-3">
+                    <div class="col-md-3">
+                        <label for="chatPetId" class="form-label">ID do Pet</label>
+                        <input type="number" class="form-control" id="chatPetId" value="1" required>
+                    </div>
+                    <div class="col-md-9">
+                        <label for="chatMensagem" class="form-label">Dúvida ou Sintoma do Pet</label>
+                        <input type="text" class="form-control" id="chatMensagem" placeholder="Ex: O meu pet está muito quieto e com respiração ofegante..." required>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-success">
+                    <i class="fa-solid fa-paper-plane me-1"></i> Perguntar à IA
+                </button>
+            </form>
+
+            <div id="loadingIa" class="mt-3 text-muted" style="display: none;">
+                <i class="fa-solid fa-spinner fa-spin me-1"></i> A IA está a analisar a telemetria e a preparar a resposta...
+            </div>
+
+            
+            <div id="respostaIaContainer" class="mt-4" style="display: none;">
+                <div class="card bg-light border">
+                    <div class="card-body">
+                        <h6 class="text-success fw-bold"><i class="fa-solid fa-stethoscope me-1"></i> Resposta do Assistente Veterinário:</h6>
+                        <p id="textoRespostaIa" class="mb-2" style="white-space: pre-line;"></p>
+                        <hr>
+                        <small class="text-muted">
+                            <i class="fa-solid fa-heart-pulse me-1"></i> <strong>Telemetria considerada:</strong> <span id="textoTelemetriaUsada"></span>
+                        </small>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+<div class="section-block mt-4">
+    <div class="card">
+        <div class="card-header d-flex align-items-center gap-2">
+            <i class="fa-solid fa-heart-pulse text-primary"></i>
+            <span>Registo de Telemetria IoT (MongoDB)</span>
+        </div>
+        <div class="card-body">
+            <form id="formTelemetria" onsubmit="enviarTelemetriaForm(event)">
+                <div class="row g-3">
+                    <div class="col-md-3">
+                        <label for="petId" class="form-label">ID do Pet</label>
+                        <input type="number" class="form-control" id="petId" value="1" required>
+                    </div>
+                    <div class="col-md-3">
+                        <label for="batimentos" class="form-label">Batimentos (BPM)</label>
+                        <input type="number" step="0.1" class="form-control" id="batimentos" value="120.0" required>
+                    </div>
+                    <div class="col-md-3">
+                        <label for="temperatura" class="form-label">Temperatura (°C)</label>
+                        <input type="number" step="0.1" class="form-control" id="temperatura" value="38.5" required>
+                    </div>
+                    <div class="col-md-3">
+                        <label for="statusGeral" class="form-label">Status Geral</label>
+                        <input type="text" class="form-control" id="statusGeral" value="Estável" required>
+                    </div>
+                </div>
+                <div class="mt-3">
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fa-solid fa-upload me-1"></i> Enviar Telemetria
+                    </button>
+                </div>
+            </form>
+            <div id="telemetriaStatus" class="mt-3" style="display: none;"></div>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script>
+        async function enviarMensagemIa(event) {
+            event.preventDefault();
+
+            const loadingEl = document.getElementById("loadingIa");
+            const respostaContainer = document.getElementById("respostaIaContainer");
+            const textoResposta = document.getElementById("textoRespostaIa");
+            const textoTelemetria = document.getElementById("textoTelemetriaUsada");
+
+            loadingEl.style.display = "block";
+            respostaContainer.style.display = "none";
+
+            const payload = {
+                petId: parseInt(document.getElementById("chatPetId").value),
+                mensagem: document.getElementById("chatMensagem").value
+            };
+
+            try {
+                const resposta = await fetch('/api/IaConsultas/perguntar', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                loadingEl.style.display = "none";
+
+                if (resposta.ok) {
+                    const resultado = await resposta.json();
+                    textoResposta.innerText = resultado.resposta;
+                    textoTelemetria.innerText = resultado.telemetriaUsada;
+                    respostaContainer.style.display = "block";
+                } else {
+                    alert("Erro ao consultar a IA. Verifique os logs da API.");
+                }
+            } catch (erro) {
+                loadingEl.style.display = "none";
+                console.error("Erro:", erro);
+                alert("Erro de conexão com o servidor.");
+            }
+        }
+
+        async function enviarTelemetriaForm(event) {
+            event.preventDefault();
+
+            const statusDiv = document.getElementById("telemetriaStatus");
+            statusDiv.style.display = "block";
+            statusDiv.className = "alert alert-warning mb-0";
+            statusDiv.innerHTML = '<i class="fa-solid fa-spinner fa-spin me-1"></i> A enviar telemetria para o MongoDB...';
+
+            const payload = {
+                petId: parseInt(document.getElementById("petId").value),
+                batimentosCardiacos: parseFloat(document.getElementById("batimentos").value),
+                temperatura: parseFloat(document.getElementById("temperatura").value),
+                statusGeral: document.getElementById("statusGeral").value,
+                dataLeitura: new Date().toISOString()
+            };
+
+            try {
+                const resposta = await fetch('/api/Telemetria', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (resposta.ok) {
+                    statusDiv.className = "alert alert-success mb-0";
+                    statusDiv.innerHTML = '<i class="fa-solid fa-check-circle me-1"></i> Sucesso! Telemetria gravada no MongoDB.';
+                } else {
+                    statusDiv.className = "alert alert-danger mb-0";
+                    statusDiv.innerHTML = '<i class="fa-solid fa-triangle-exclamation me-1"></i> Erro ao enviar telemetria.';
+                }
+            } catch (erro) {
+                statusDiv.className = "alert alert-danger mb-0";
+                statusDiv.innerHTML = '<i class="fa-solid fa-triangle-exclamation me-1"></i> Erro de conexão com a API.';
+            }
+        }
+    </script>
+}

@@ -1,0 +1,71 @@
+@model IEnumerable<YourPetHealth.Models.Consulta>
+
+@{
+    ViewData["Title"] = "Consultas";
+}
+
+<div class="page-header">
+    <div>
+        <h1 class="page-title"><i class="fa-solid fa-calendar-check"></i> Consultas</h1>
+        <p class="page-subtitle">Agendamentos e histórico de atendimentos</p>
+    </div>
+    <div class="page-actions">
+        @if (User.IsInRole("RESPONSAVEL"))
+        {
+            <a asp-action="Create" class="btn btn-primary">
+                <i class="fa-solid fa-plus"></i> Agendar consulta
+            </a>
+        }
+    </div>
+</div>
+
+@if (TempData["Sucesso"] != null)
+{
+    <div class="alert alert-success mb-3">@TempData["Sucesso"]</div>
+}
+
+@if (!Model.Any())
+{
+    <div class="empty-state">
+        <div class="empty-icon"><i class="fa-solid fa-calendar"></i></div>
+        <p>Nenhuma consulta registrada.</p>
+        @if (User.IsInRole("RESPONSAVEL"))
+        {
+            <a asp-action="Create" class="btn btn-primary">Agendar a primeira</a>
+        }
+    </div>
+}
+else
+{
+    <div class="list-stack">
+        @foreach (var item in Model)
+        {
+            var badgeClass = item.Status switch
+            {
+                "REALIZADA" => "badge-status-realizada",
+                "CANCELADA" => "badge-status-cancelada",
+                _ => "badge-status-agendada"
+            };
+            <div class="list-row">
+                <div class="list-main">
+                    <div class="list-title">@item.Pet?.Nome <span class="text-muted fw-normal">· @item.Veterinario?.Nome</span></div>
+                    <div class="list-meta">
+                        @item.Tipo · @item.Data.ToString("dd/MM/yyyy 'às' HH:mm")
+                        @if (!string.IsNullOrWhiteSpace(item.Descricao))
+                        {
+                            <text> · @item.Descricao</text>
+                        }
+                    </div>
+                </div>
+                <div class="list-actions">
+                    <span class="badge @badgeClass">@item.Status</span>
+                    @if (User.IsInRole("VETERINARIO") || User.IsInRole("ADMIN"))
+                    {
+                        <a asp-action="Edit" asp-route-id="@item.Id" class="btn btn-sm btn-outline-secondary">Editar</a>
+                    }
+                    <a asp-action="Delete" asp-route-id="@item.Id" class="btn btn-sm btn-outline-secondary">Excluir</a>
+                </div>
+            </div>
+        }
+    </div>
+}

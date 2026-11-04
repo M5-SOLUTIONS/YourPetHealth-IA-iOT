@@ -1,0 +1,64 @@
+@model IEnumerable<YourPetHealth.Models.Veterinario>
+
+@{
+    ViewData["Title"] = "Veterinários";
+}
+
+<div class="page-header">
+    <div>
+        <h1 class="page-title"><i class="fa-solid fa-user-doctor"></i> Veterinários</h1>
+        <p class="page-subtitle">Profissionais cadastrados na clínica</p>
+    </div>
+    <div class="page-actions">
+        @if (User.IsInRole("ADMIN"))
+        {
+            <a asp-action="Create" class="btn btn-primary">
+                <i class="fa-solid fa-plus"></i> Novo veterinário
+            </a>
+        }
+    </div>
+</div>
+
+@if (!Model.Any())
+{
+    <div class="empty-state">
+        <div class="empty-icon"><i class="fa-solid fa-user-doctor"></i></div>
+        <p>Nenhum veterinário cadastrado.</p>
+    </div>
+}
+else
+{
+    <div class="table-card">
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>Nome</th>
+                    <th>E-mail</th>
+                    <th>Telefone</th>
+                    <th>CRMV</th>
+                    <th>Especialidade</th>
+                    <th class="text-end">Ações</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var item in Model)
+                {
+                    <tr>
+                        <td><strong>@item.Nome</strong></td>
+                        <td>@item.Email</td>
+                        <td>@item.Telefone</td>
+                        <td>@item.Crmv</td>
+                        <td>@item.Especialidade</td>
+                        <td class="text-end">
+                            @if (User.IsInRole("VETERINARIO") || User.IsInRole("ADMIN"))
+                            {
+                                <a asp-action="Edit" asp-route-id="@item.Id" class="btn btn-sm btn-outline-secondary">Editar</a>
+                                <a asp-action="Delete" asp-route-id="@item.Id" class="btn btn-sm btn-outline-secondary">Excluir</a>
+                            }
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+}

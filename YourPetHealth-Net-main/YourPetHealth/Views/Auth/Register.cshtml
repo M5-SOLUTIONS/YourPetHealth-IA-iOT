@@ -1,0 +1,89 @@
+@model YourPetHealth.Controllers.RegisterViewModel
+@{
+    ViewData["Title"] = "Criar conta";
+}
+
+<div class="auth-wrap">
+    <div class="form-shell" style="width:100%">
+        <div class="form-card-header">
+            <h1>Criar conta</h1>
+            <p>Leva menos de um minuto</p>
+        </div>
+
+        @if (!ViewData.ModelState.IsValid)
+        {
+            <div class="alert alert-danger mb-3">
+                @foreach (var erro in ViewData.ModelState.Values.SelectMany(v => v.Errors))
+                {
+                    <div>@erro.ErrorMessage</div>
+                }
+            </div>
+        }
+
+        <div class="form-panel">
+            <form asp-controller="Auth" asp-action="Register" method="post">
+                @Html.AntiForgeryToken()
+                <div class="form-group">
+                    <label asp-for="Nome">Nome completo</label>
+                    <input asp-for="Nome" required autofocus />
+                </div>
+                <div class="form-group">
+                    <label asp-for="Email">E-mail</label>
+                    <input asp-for="Email" type="email" required />
+                </div>
+                <div class="form-group">
+                    <label asp-for="Senha">Senha</label>
+                    <input asp-for="Senha" type="password" required minlength="8" />
+                    <span class="form-hint">No mínimo 8 caracteres.</span>
+                </div>
+                <div class="form-group">
+                    <label asp-for="Telefone">Telefone</label>
+                    <input asp-for="Telefone" placeholder="11987654321" />
+                </div>
+                <div class="form-group">
+                    <label asp-for="TipoConta">Tipo de conta</label>
+                    <select asp-for="TipoConta" id="tipoConta" required>
+                        <option value="">Selecione</option>
+                        <option value="RESPONSAVEL">Tutor de pet</option>
+                        <option value="VETERINARIO">Veterinário</option>
+                    </select>
+                </div>
+
+                <div id="camposVet" style="display:none">
+                    <div class="form-group">
+                        <label asp-for="Crmv">CRMV</label>
+                        <input asp-for="Crmv" />
+                    </div>
+                    <div class="form-group">
+                        <label asp-for="Especialidade">Especialidade</label>
+                        <input asp-for="Especialidade" placeholder="Clínica Geral, Cirurgia..." />
+                    </div>
+                </div>
+
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary w-100">
+                        <i class="fa-solid fa-user-plus"></i> Criar conta
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <p class="text-center mt-4 text-muted">
+            Já tem conta? <a asp-controller="Auth" asp-action="Login">Entrar</a>
+        </p>
+    </div>
+</div>
+
+@section Scripts {
+    <script>
+        (function () {
+            var sel = document.getElementById('tipoConta');
+            var box = document.getElementById('camposVet');
+            function toggle() {
+                box.style.display = sel.value === 'VETERINARIO' ? 'block' : 'none';
+            }
+            sel.addEventListener('change', toggle);
+            toggle();
+        })();
+    </script>
+}

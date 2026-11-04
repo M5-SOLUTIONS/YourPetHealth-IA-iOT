@@ -1,0 +1,54 @@
+@model YourPetHealth.Models.HistoricoClinico
+
+@{
+    ViewData["Title"] = "Excluir histórico";
+}
+
+<div class="crumb">
+    <a asp-action="Index">Histórico clínico</a>
+    <span class="sep">/</span>
+    <span>Excluir</span>
+</div>
+
+<div class="form-shell">
+    <div class="form-card-header">
+        <h1><i class="fa-solid fa-trash"></i> Excluir registro</h1>
+        <p>Confirme se deseja remover este item</p>
+    </div>
+
+    <div class="form-panel">
+        <div class="alert alert-danger mb-4">
+            <i class="fa-solid fa-triangle-exclamation me-1"></i>
+            <strong>Atenção:</strong> esta ação não pode ser desfeita.
+        </div>
+
+        <div class="detail-grid mb-4">
+            <div class="detail-item">
+                <div class="label">Pet</div>
+                <div class="value">@(Model.Pet?.Nome ?? "—")</div>
+            </div>
+            <div class="detail-item">
+                <div class="label">Tipo</div>
+                <div class="value">@Model.Tipo</div>
+            </div>
+            <div class="detail-item">
+                <div class="label">Data</div>
+                <div class="value">@Model.Data.ToString("dd/MM/yyyy")</div>
+            </div>
+            <div class="detail-item">
+                <div class="label">Descrição</div>
+                <div class="value">@(Model.Descricao ?? "—")</div>
+            </div>
+        </div>
+
+        <form asp-action="Delete" method="post">
+            <input type="hidden" asp-for="Id" />
+            <div class="form-actions">
+                <button type="submit" class="btn btn-danger-soft">
+                    <i class="fa-solid fa-trash"></i> Sim, excluir
+                </button>
+                <a asp-action="Index" class="btn btn-secondary">Cancelar</a>
+            </div>
+        </form>
+    </div>
+</div>

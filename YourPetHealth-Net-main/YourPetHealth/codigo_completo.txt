@@ -1,0 +1,3093 @@
+﻿using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using Oracle.EntityFrameworkCore.Infrastructure;
+using OpenTelemetry;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
+using Serilog;
+using YourPetHealth.Data;
+using YourPetHealth.Diagnostics;
+using YourPetHealth.HealthChecks;
+using YourPetHealth.Middleware;
+using YourPetHealth.Models;
+using YourPetHealth.Services; // <-- Adicionado para reconhecer o MongoDbService
+
+Log.Logger = new LoggerConfiguration()
+    .WriteTo.Console()
+    .CreateBootstrapLogger();
+
+try
+{
+    var builder = WebApplication.CreateBuilder(args);
+
+    builder.Host.UseSerilog((context, services, configuration) => configuration
+        .ReadFrom.Configuration(context.Configuration)
+        .ReadFrom.Services(services)
+        .Enrich.FromLogContext()
+        .Enrich.WithMachineName()
+        .Enrich.WithThreadId());
+
+    builder.Services.AddControllersWithViews();
+
+    // Registo do Swagger / OpenAPI
+    builder.Services.AddEndpointsApiExplorer();
+    builder.Services.AddSwaggerGen();
+
+    // Registo do ServiÃ§o do MongoDB para a Telemetria
+    builder.Services.AddSingleton<MongoDbService>();
+
+    builder.Services.AddDbContext<AppDbContext>(options =>
+        options.UseOracle(
+            builder.Configuration.GetConnectionString("OracleConnection"),
+            oracleOptions => oracleOptions.UseOracleSQLCompatibility(OracleSQLCompatibility.DatabaseVersion19)
+        )
+    );
+
+    builder.Services.AddScoped<IPasswordHasher<Usuario>, PasswordHasher<Usuario>>();
+
+    builder.Services
+        .AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+        .AddCookie(options =>
+        {
+            options.LoginPath = "/Auth/Login";
+            options.AccessDeniedPath = "/Auth/Login";
+            options.ExpireTimeSpan = TimeSpan.FromHours(8);
+            options.SlidingExpiration = true;
+        });
+
+    builder.Services
+        .AddHealthChecks()
+        .AddCheck<OracleDatabaseHealthCheck>(
+            "oracle_database",
+            tags: new[] { "db", "oracle", "ready" })
+        .AddCheck<ExternalServiceHealthCheck>(
+            "external_service",
+            tags: new[] { "external", "ready" });
+
+    builder.Services.AddHttpClient<ExternalServiceHealthCheck>();
+
+    builder.Services.AddOpenTelemetry()
+        .ConfigureResource(resource => resource.AddService(
+            serviceName: AppDiagnostics.ServiceName,
+            serviceVersion: "1.0.0"))
+        .WithTracing(tracing => tracing
+            .AddSource(AppDiagnostics.ServiceName)
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation()
+            .AddConsoleExporter())
+        .WithMetrics(metrics => metrics
+            .AddMeter(AppDiagnostics.ServiceName)
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation()
+            .AddConsoleExporter());
+
+    var app = builder.Build();
+
+    app.UseSerilogRequestLogging();
+
+    app.UseMiddleware<CorrelationIdMiddleware>();
+
+    if (!app.Environment.IsDevelopment())
+    {
+        app.UseExceptionHandler("/Home/Error");
+    }
+    else
+    {
+        // AtivaÃ§Ã£o do Swagger no ambiente de desenvolvimento
+        app.UseSwagger();
+        app.UseSwaggerUI();
+    }
+
+    app.UseStaticFiles();
+
+    app.UseRouting();
+
+    app.UseAuthentication();
+    app.UseAuthorization();
+
+    app.MapHealthChecks("/health", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+    {
+        ResponseWriter = HealthCheckResponseWriter.WriteResponse
+    });
+
+    app.MapHealthChecks("/health/ready", new Microsoft.AspNetCore.Diagnostics.HealthChecks.HealthCheckOptions
+    {
+        Predicate = check => check.Tags.Contains("ready"),
+        ResponseWriter = HealthCheckResponseWriter.WriteResponse
+    });
+
+    app.MapControllerRoute(
+        name: "default",
+        pattern: "{controller=Home}/{action=Index}/{id?}");
+
+    app.Run();
+}
+catch (Exception ex) when (ex.GetType().Name != "StopTheHostException")
+{
+    Log.Fatal(ex, "A aplicaÃ§Ã£o encerrou de forma inesperada durante a inicializaÃ§Ã£o");
+}
+finally
+{
+    Log.CloseAndFlush();
+}
+
+public partial class Program { }
+using System.ComponentModel.DataAnnotations;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using YourPetHealth.Data;
+using YourPetHealth.Diagnostics;
+using YourPetHealth.Models;
+
+namespace YourPetHealth.Controllers
+{
+    public class AuthController : Controller
+    {
+        private readonly AppDbContext _context;
+        private readonly IPasswordHasher<Usuario> _passwordHasher;
+        private readonly ILogger<AuthController> _logger;
+
+        public AuthController(AppDbContext context, IPasswordHasher<Usuario> passwordHasher, ILogger<AuthController> logger)
+        {
+            _context = context;
+            _passwordHasher = passwordHasher;
+            _logger = logger;
+        }
+
+        [HttpGet]
+        public IActionResult Login(string? returnUrl = null)
+        {
+            ViewData["ReturnUrl"] = returnUrl;
+            return View();
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> Login(string email, string senha, string? returnUrl = null)
+        {
+            using var activity = AppDiagnostics.ActivitySource.StartActivity("Auth.Login");
+            activity?.SetTag("auth.email", email);
+
+            ViewData["ReturnUrl"] = returnUrl;
+
+            if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(senha))
+            {
+                ModelState.AddModelError(string.Empty, "Informe email e senha.");
+                return View();
+            }
+
+            var usuario = await _context.Usuarios
+                .Include(u => u.Responsavel)
+                .Include(u => u.Veterinario)
+                .FirstOrDefaultAsync(u => u.Email == email && u.Ativo);
+
+            if (usuario == null)
+            {
+                AppDiagnostics.LoginsFalhos.Add(1);
+                _logger.LogWarning("Tentativa de login falhou: email {Email} nÃ£o encontrado ou inativo", email);
+                ModelState.AddModelError(string.Empty, "Email ou senha invÃ¡lidos.");
+                return View();
+            }
+
+            var resultado = _passwordHasher.VerifyHashedPassword(usuario, usuario.SenhaHash, senha);
+            if (resultado == PasswordVerificationResult.Failed)
+            {
+                AppDiagnostics.LoginsFalhos.Add(1);
+                _logger.LogWarning("Tentativa de login falhou: senha incorreta para {Email}", email);
+                ModelState.AddModelError(string.Empty, "Email ou senha invÃ¡lidos.");
+                return View();
+            }
+
+            var nomeExibicao =
+                usuario.Responsavel?.Nome
+                ?? usuario.Veterinario?.Nome
+                ?? usuario.Email;
+
+            var claims = new List<Claim>
+            {
+                new(ClaimTypes.NameIdentifier, usuario.Id.ToString()),
+                new(ClaimTypes.Name, nomeExibicao),
+                new(ClaimTypes.Email, usuario.Email),
+                new(ClaimTypes.Role, usuario.Perfil)
+            };
+
+            if (usuario.ResponsavelId.HasValue)
+                claims.Add(new Claim("EntidadeId", usuario.ResponsavelId.Value.ToString()));
+            if (usuario.VeterinarioId.HasValue)
+                claims.Add(new Claim("EntidadeId", usuario.VeterinarioId.Value.ToString()));
+
+            var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+            await HttpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
+                new ClaimsPrincipal(identity));
+
+            AppDiagnostics.LoginsRealizados.Add(1);
+            activity?.SetTag("auth.perfil", usuario.Perfil);
+            _logger.LogInformation("Login bem-sucedido para {Email} (perfil {Perfil})", email, usuario.Perfil);
+
+            if (!string.IsNullOrEmpty(returnUrl) && Url.IsLocalUrl(returnUrl))
+                return Redirect(returnUrl);
+
+            return usuario.Perfil switch
+            {
+                PerfilUsuario.Veterinario => RedirectToAction("Index", "Responsaveis"),
+                PerfilUsuario.Responsavel => RedirectToAction("Index", "Pets"),
+                _ => RedirectToAction("Index", "Home")
+            };
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> Logout()
+        {
+            await HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+            TempData["Sucesso"] = "VocÃª saiu da sua conta.";
+            return RedirectToAction(nameof(Login));
+        }
+
+        [AllowAnonymous]
+        public IActionResult Register() => View();
+
+        [AllowAnonymous]
+        [HttpPost]
+        public async Task<IActionResult> Register(RegisterViewModel model)
+        {
+            if (model.TipoConta != PerfilUsuario.Responsavel && model.TipoConta != PerfilUsuario.Veterinario)
+                ModelState.AddModelError(nameof(model.TipoConta), "Selecione o tipo de conta.");
+
+            if (model.TipoConta == PerfilUsuario.Veterinario)
+            {
+                ModelState.Remove(nameof(model.Crmv));
+                if (string.IsNullOrWhiteSpace(model.Crmv))
+                    ModelState.AddModelError(nameof(model.Crmv), "CRMV Ã© obrigatÃ³rio para veterinÃ¡rios.");
+            }
+            else
+            {
+                ModelState.Remove(nameof(model.Crmv));
+                ModelState.Remove(nameof(model.Especialidade));
+            }
+
+            if (!ModelState.IsValid) return View(model);
+
+            using var transaction = await _context.Database.BeginTransactionAsync();
+            int entidadeId;
+
+            if (model.TipoConta == PerfilUsuario.Veterinario)
+            {
+                if (await _context.Veterinarios.AnyAsync(v => v.Email == model.Email))
+                {
+                    ModelState.AddModelError(nameof(model.Email), "Email jÃ¡ cadastrado.");
+                    return View(model);
+                }
+                if (await _context.Veterinarios.AnyAsync(v => v.Crmv == model.Crmv))
+                {
+                    ModelState.AddModelError(nameof(model.Crmv), "CRMV jÃ¡ cadastrado.");
+                    return View(model);
+                }
+
+                var veterinario = new Veterinario
+                {
+                    Nome = model.Nome,
+                    Email = model.Email,
+                    Telefone = model.Telefone,
+                    Crmv = model.Crmv!,
+                    Especialidade = model.Especialidade
+                };
+                _context.Veterinarios.Add(veterinario);
+                await _context.SaveChangesAsync();
+                entidadeId = veterinario.Id;
+            }
+            else
+            {
+                if (await _context.Responsaveis.AnyAsync(r => r.Email == model.Email))
+                {
+                    ModelState.AddModelError(nameof(model.Email), "Email jÃ¡ cadastrado.");
+                    return View(model);
+                }
+
+                var responsavel = new Responsavel
+                {
+                    Nome = model.Nome,
+                    Email = model.Email,
+                    Telefone = model.Telefone
+                };
+                _context.Responsaveis.Add(responsavel);
+                await _context.SaveChangesAsync();
+                entidadeId = responsavel.Id;
+
+                AppDiagnostics.CadastrosResponsavel.Add(1);
+            }
+
+            var usuario = new Usuario
+            {
+                Email = model.Email,
+                Perfil = model.TipoConta,
+                Ativo = true,
+                CriadoEm = DateTime.UtcNow,
+                ResponsavelId = model.TipoConta == PerfilUsuario.Responsavel ? entidadeId : null,
+                VeterinarioId = model.TipoConta == PerfilUsuario.Veterinario ? entidadeId : null
+            };
+            usuario.SenhaHash = _passwordHasher.HashPassword(usuario, model.Senha);
+
+            _context.Usuarios.Add(usuario);
+            await _context.SaveChangesAsync();
+            await transaction.CommitAsync();
+
+            _logger.LogInformation("Conta criada para {Email} (perfil {Perfil})", model.Email, model.TipoConta);
+            TempData["Sucesso"] = "Conta criada com sucesso! JÃ¡ pode entrar.";
+            return RedirectToAction(nameof(Login));
+        }
+    }
+
+    public class RegisterViewModel
+    {
+        [Required(ErrorMessage = "Nome Ã© obrigatÃ³rio")]
+        public string Nome { get; set; } = string.Empty;
+
+        [Required(ErrorMessage = "Email Ã© obrigatÃ³rio")]
+        [EmailAddress]
+        public string Email { get; set; } = string.Empty;
+
+        [Required(ErrorMessage = "Senha Ã© obrigatÃ³ria")]
+        [MinLength(8, ErrorMessage = "A senha precisa ter no mÃ­nimo 8 caracteres.")]
+        public string Senha { get; set; } = string.Empty;
+
+        public string? Telefone { get; set; }
+
+        [Required(ErrorMessage = "Selecione o tipo de conta")]
+        public string TipoConta { get; set; } = string.Empty;
+
+        public string? Crmv { get; set; }
+        public string? Especialidade { get; set; }
+    }
+}
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Rendering;
+using Microsoft.EntityFrameworkCore;
+using YourPetHealth.Data;
+using YourPetHealth.Extensions;
+using YourPetHealth.Models;
+
+namespace YourPetHealth.Controllers
+{
+    [Authorize]
+    public class ConsultasController : Controller
+    {
+        private readonly AppDbContext _context;
+        public ConsultasController(AppDbContext context) => _context = context;
+
+        public async Task<IActionResult> Index()
+        {
+            var query = _context.Consultas.Include(c => c.Pet).ThenInclude(p => p.Responsavel).Include(c => c.Veterinario).AsQueryable();
+
+            var meuId = User.GetEntidadeId();
+            if (User.IsInRole(PerfilUsuario.Responsavel))
+                query = query.Where(c => c.Pet.ResponsavelId == meuId);
+            else if (User.IsInRole(PerfilUsuario.Veterinario))
+                query = query.Where(c => c.VeterinarioId == meuId);
+
+            return View(await query.OrderByDescending(c => c.Data).ToListAsync());
+        }
+
+        [Authorize(Roles = "RESPONSAVEL")]
+        public async Task<IActionResult> Create()
+        {
+            var meuId = User.GetEntidadeId();
+            ViewBag.PetId = new SelectList(
+                await _context.Pets.Where(p => p.ResponsavelId == meuId).ToListAsync(), "Id", "Nome");
+            ViewBag.VeterinarioId = new SelectList(await _context.Veterinarios.ToListAsync(), "Id", "Nome");
+            return View();
+        }
+
+        [Authorize(Roles = "RESPONSAVEL")]
+        [HttpPost]
+        public async Task<IActionResult> Create(Consulta c)
+        {
+            var meuId = User.GetEntidadeId();
+            var meusPets = await _context.Pets.Where(p => p.ResponsavelId == meuId).ToListAsync();
+
+            ViewBag.PetId = new SelectList(meusPets, "Id", "Nome", c.PetId);
+            ViewBag.VeterinarioId = new SelectList(await _context.Veterinarios.ToListAsync(), "Id", "Nome", c.VeterinarioId);
+
+            if (!meusPets.Any(p => p.Id == c.PetId))
+            {
+                ModelState.AddModelError("PetId", "Selecione um dos seus pets.");
+                return View(c);
+            }
+
+            c.Status = "AGENDADA";
+            ModelState.Remove(nameof(Consulta.Status));
+
+            if (!ModelState.IsValid) return View(c);
+
+            _context.Consultas.Add(c);
+            await _context.SaveChangesAsync();
+
+            TempData["Sucesso"] = "Consulta agendada com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+
+        [Authorize(Roles = "VETERINARIO,ADMIN")]
+        public async Task<IActionResult> Edit(int id)
+        {
+            var c = await _context.Consultas.FindAsync(id);
+            if (c == null) return NotFound();
+            if (!ResponsavelPelaConsulta(c)) return Forbid();
+
+            ViewBag.Petid = new SelectList(await _context.Pets.ToListAsync(), "Id", "Nome", c.PetId);
+            ViewBag.VeterinarioId = new SelectList(await _context.Veterinarios.ToListAsync(), "Id", "Nome", c.VeterinarioId);
+            return View(c);
+        }
+
+        [Authorize(Roles = "VETERINARIO,ADMIN")]
+        [HttpPost]
+        public async Task<IActionResult> Edit(Consulta atualizado)
+        {
+            var consulta = await _context.Consultas.FindAsync(atualizado.Id);
+            if (consulta == null) return NotFound();
+            if (!ResponsavelPelaConsulta(consulta)) return Forbid();
+
+            ViewBag.PetId = new SelectList(await _context.Pets.ToListAsync(), "Id", "Nome", atualizado.PetId);
+            ViewBag.VeterinarioId = new SelectList(await _context.Veterinarios.ToListAsync(), "Id", "Nome", atualizado.VeterinarioId);
+
+            var status = atualizado.Status?.ToUpper() ?? "";
+            if (status != "REALIZADA" && status != "CANCELADA")
+            {
+                ModelState.AddModelError("Status", "Status deve ser atualizado para Realizada ou Cancelada!");
+                return View(atualizado);
+            }
+
+            consulta.Status = status;
+            consulta.Observacoes = atualizado.Observacoes;
+
+            await _context.SaveChangesAsync();
+
+            TempData["Sucesso"] = "Consulta atualizada com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+
+        public async Task<IActionResult> Delete(int id)
+        {
+            var c = await _context.Consultas.Include(x => x.Pet).ThenInclude(p => p.Responsavel).Include(x => x.Veterinario).FirstOrDefaultAsync(x => x.Id == id);
+            if (c == null) return NotFound();
+            if (!PodeVerConsulta(c)) return Forbid();
+            return View(c);
+        }
+
+        [HttpPost, ActionName("Delete")]
+        public async Task<IActionResult> DeleteConfirmed(int id)
+        {
+            var c = await _context.Consultas.Include(x => x.Pet).FirstOrDefaultAsync(x => x.Id == id);
+            if (c == null) return NotFound();
+            if (!PodeVerConsulta(c)) return Forbid();
+
+            _context.Consultas.Remove(c);
+            await _context.SaveChangesAsync();
+
+            TempData["Sucesso"] = "Consulta removida com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+
+        private bool ResponsavelPelaConsulta(Consulta c) =>
+            User.IsInRole(PerfilUsuario.Admin) || c.VeterinarioId == User.GetEntidadeId();
+
+        private bool PodeVerConsulta(Consulta c)
+        {
+            if (User.IsInRole(PerfilUsuario.Admin)) return true;
+            if (User.IsInRole(PerfilUsuario.Veterinario)) return c.VeterinarioId == User.GetEntidadeId();
+            if (User.IsInRole(PerfilUsuario.Responsavel)) return c.Pet.ResponsavelId == User.GetEntidadeId();
+            return false;
+        }
+    }
+}
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Rendering;
+using Microsoft.EntityFrameworkCore;
+using YourPetHealth.Data;
+using YourPetHealth.Models;
+
+namespace YourPetHealth.Controllers
+{
+    [Authorize]
+    public class HistoricoClinicoController : Controller
+    {
+        private readonly AppDbContext _context;
+        public HistoricoClinicoController(AppDbContext context) => _context = context;
+
+        public async Task<IActionResult> Index(int PetId = 0)
+        {
+            List<Consulta> historico = [];
+            ViewBag.Petid = new SelectList(await _context.Pets.ToListAsync(), "Id", "Nome", PetId);
+
+            if (PetId == 0)
+            {
+                historico = _context.Consultas.Include(c => c.Pet).OrderByDescending(h => h.Data).Where(h => h.Status == "REALIZADA").ToList();
+            }
+            else
+            {
+                historico = _context.Consultas.Include(c => c.Pet).OrderByDescending(h => h.Data).Where(h => h.Status == "REALIZADA").Where(h => h.PetId == PetId).ToList();
+            }
+            return View(historico);
+        }
+    }
+}
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using YourPetHealth.Data;
+using YourPetHealth.Extensions;
+using YourPetHealth.Models;
+
+namespace YourPetHealth.Controllers
+{
+    public class HomeController : Controller
+    {
+        private readonly AppDbContext _context;
+
+        public HomeController(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        public async Task<IActionResult> Index()
+        {
+            if (User.IsInRole(PerfilUsuario.Responsavel))
+            {
+                var meuId = User.GetEntidadeId();
+                var agora = DateTime.Now;
+
+                var meusPets = await _context.Pets
+                    .Where(p => p.ResponsavelId == meuId)
+                    .ToListAsync();
+
+                var proximasConsultas = await _context.Consultas
+                    .Include(c => c.Pet)
+                    .Include(c => c.Veterinario)
+                    .Where(c => c.Pet.ResponsavelId == meuId && c.Status == "AGENDADA" && c.Data >= agora)
+                    .OrderBy(c => c.Data)
+                    .Take(5)
+                    .ToListAsync();
+
+                ViewBag.MeusPets = meusPets;
+                ViewBag.ProximasConsultas = proximasConsultas;
+                ViewBag.ConsultasProximas48h = proximasConsultas.Count(c => c.Data <= agora.AddHours(48));
+
+                return View("Tutor");
+            }
+
+            ViewBag.TotalResponsaveis = await _context.Responsaveis.CountAsync();
+            ViewBag.TotalVeterinarios = await _context.Veterinarios.CountAsync();
+            ViewBag.TotalPets = await _context.Pets.CountAsync();
+            ViewBag.TotalConsultas = await _context.Consultas.CountAsync();
+            ViewBag.ConsultasAgendadas = await _context.Consultas.CountAsync(c => c.Status == "AGENDADA");
+
+            return View();
+        }
+
+        public IActionResult Privacy() => View();
+
+        [ResponseCache(Duration = 0, Location = ResponseCacheLocation.None, NoStore = true)]
+        public IActionResult Error()
+        {
+            var requestId = System.Diagnostics.Activity.Current?.Id ?? HttpContext.TraceIdentifier;
+            return View(new YourPetHealth_.Models.ErrorViewModel { RequestId = requestId });
+        }
+    }
+}
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Rendering;
+using Microsoft.EntityFrameworkCore;
+using YourPetHealth.Data;
+using YourPetHealth.Extensions;
+using YourPetHealth.Models;
+
+namespace YourPetHealth.Controllers
+{
+    [Authorize]
+    public class PetsController : Controller
+    {
+        private readonly AppDbContext _context;
+        public PetsController(AppDbContext context) => _context = context;
+
+        public async Task<IActionResult> Index()
+        {
+            var query = _context.Pets.Include(p => p.Responsavel).AsQueryable();
+
+            if (User.IsInRole(PerfilUsuario.Responsavel))
+            {
+                var meuId = User.GetEntidadeId();
+                query = query.Where(p => p.ResponsavelId == meuId);
+            }
+
+            return View(await query.ToListAsync());
+        }
+
+        public async Task<IActionResult> Details(int id)
+        {
+            var pet = await _context.Pets
+                .Include(p => p.Responsavel)
+                .Include(p => p.Consultas).ThenInclude(c => c.Veterinario)
+                .FirstOrDefaultAsync(p => p.Id == id);
+
+            if (pet == null) return NotFound();
+
+            if (User.IsInRole(PerfilUsuario.Responsavel) && !DonoDoPet(pet))
+                return Forbid();
+
+            ViewBag.TemConsultaAgendada = pet.Consultas.Any(c => c.Status == "AGENDADA");
+
+            return View(pet);
+        }
+
+        [Authorize(Roles = "RESPONSAVEL")]
+        public IActionResult Create() => View();
+
+        [Authorize(Roles = "RESPONSAVEL")]
+        [HttpPost]
+        public async Task<IActionResult> Create(Pet p)
+        {
+            var meuId = User.GetEntidadeId();
+            if (meuId == null) return Forbid();
+            p.ResponsavelId = meuId.Value;
+
+            ModelState.Remove(nameof(Pet.ResponsavelId));
+            if (!ModelState.IsValid) return View(p);
+
+            p.Sexo = p.Sexo.ToUpper();
+
+            _context.Pets.Add(p);
+            await _context.SaveChangesAsync();
+
+            TempData["Sucesso"] = "Pet cadastrado com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+
+        [Authorize(Roles = "RESPONSAVEL")]
+        public async Task<IActionResult> Edit(int id)
+        {
+            var p = await _context.Pets.FindAsync(id);
+            if (p == null) return NotFound();
+            if (!DonoDoPet(p)) return Forbid();
+            return View(p);
+        }
+
+        [Authorize(Roles = "RESPONSAVEL")]
+        [HttpPost]
+        public async Task<IActionResult> Edit(Pet atualizado)
+        {
+            var pet = await _context.Pets.FindAsync(atualizado.Id);
+            if (pet == null) return NotFound();
+            if (!DonoDoPet(pet)) return Forbid();
+
+            pet.Nome = atualizado.Nome;
+            pet.Raca = atualizado.Raca;
+            pet.Idade = atualizado.Idade;
+            pet.Peso = atualizado.Peso;
+            pet.Sexo = atualizado.Sexo.ToUpper();
+
+            await _context.SaveChangesAsync();
+
+            TempData["Sucesso"] = "Pet atualizado com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+
+        [Authorize(Roles = "RESPONSAVEL")]
+        public async Task<IActionResult> Delete(int id)
+        {
+            var p = await _context.Pets.Include(x => x.Responsavel).Include(x => x.Consultas).FirstOrDefaultAsync(x => x.Id == id);
+            if (p == null) return NotFound();
+            if (!DonoDoPet(p)) return Forbid();
+            ViewBag.TemConsultaAgendada = p.Consultas.Any(c => c.Status == "AGENDADA");
+            return View(p);
+        }
+
+        [Authorize(Roles = "RESPONSAVEL")]
+        [HttpPost, ActionName("Delete")]
+        public async Task<IActionResult> DeleteConfirmed(int id)
+        {
+            var p = await _context.Pets.Include(x => x.Consultas).FirstOrDefaultAsync(x => x.Id == id);
+            if (p == null) return NotFound();
+            if (!DonoDoPet(p)) return Forbid();
+
+            if (p.Consultas.Any(c => c.Status == "AGENDADA"))
+            {
+                TempData["Erro"] = "NÃ£o Ã© possÃ­vel remover um pet com consultas agendadas.";
+                return RedirectToAction(nameof(Details), new { id });
+            }
+
+            _context.Pets.Remove(p);
+            await _context.SaveChangesAsync();
+
+            TempData["Sucesso"] = "Pet removido com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+
+        private bool DonoDoPet(Pet p) => p.ResponsavelId == User.GetEntidadeId();
+    }
+}
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using YourPetHealth.Data;
+using YourPetHealth.Diagnostics;
+using YourPetHealth.Models;
+
+namespace YourPetHealth.Controllers
+{
+    [Authorize(Roles = "VETERINARIO,ADMIN")]
+    public class ResponsaveisController : Controller
+    {
+        private readonly AppDbContext _context;
+        private readonly IPasswordHasher<Usuario> _passwordHasher;
+
+        public ResponsaveisController(AppDbContext context, IPasswordHasher<Usuario> passwordHasher)
+        {
+            _context = context;
+            _passwordHasher = passwordHasher;
+        }
+
+        public async Task<IActionResult> Index()
+            => View(await _context.Responsaveis.ToListAsync());
+
+        [AllowAnonymous]
+        public IActionResult Create() => RedirectToAction("Register", "Auth");
+
+        [AllowAnonymous]
+        [HttpPost]
+        public async Task<IActionResult> Create(Responsavel r)
+        {
+            using var activity = AppDiagnostics.ActivitySource.StartActivity("Responsaveis.Create");
+            activity?.SetTag("responsavel.email", r.Email);
+
+            if (string.IsNullOrWhiteSpace(r.Senha))
+            {
+                ModelState.AddModelError("Senha", "Senha Ã© obrigatÃ³ria.");
+            }
+
+            if (!ModelState.IsValid) return View(r);
+
+            var existente = await _context.Responsaveis.AnyAsync(x => x.Email == r.Email);
+            if (existente)
+            {
+                ModelState.AddModelError("Email", "Email jÃ¡ cadastrado.");
+                return View(r);
+            }
+
+            using var transaction = await _context.Database.BeginTransactionAsync();
+
+            _context.Responsaveis.Add(r);
+            await _context.SaveChangesAsync();
+
+            var usuario = new Usuario
+            {
+                Email = r.Email,
+                Perfil = PerfilUsuario.Responsavel,
+                ResponsavelId = r.Id,
+                Ativo = true,
+                CriadoEm = DateTime.UtcNow
+            };
+            usuario.SenhaHash = _passwordHasher.HashPassword(usuario, r.Senha!);
+
+            _context.Usuarios.Add(usuario);
+            await _context.SaveChangesAsync();
+
+            await transaction.CommitAsync();
+
+            AppDiagnostics.CadastrosResponsavel.Add(1);
+
+            TempData["Sucesso"] = "ResponsÃ¡vel cadastrado com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+
+        public async Task<IActionResult> Edit(int id)
+        {
+            var r = await _context.Responsaveis.FindAsync(id);
+            if (r == null) return NotFound();
+            return View(r);
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> Edit(Responsavel atualizado)
+        {
+            if (!ModelState.IsValid) return View(atualizado);
+
+            var responsavel = await _context.Responsaveis.FindAsync(atualizado.Id);
+            if (responsavel == null) return NotFound();
+
+            responsavel.Nome = atualizado.Nome;
+            responsavel.Email = atualizado.Email;
+            responsavel.Telefone = atualizado.Telefone;
+
+            var usuario = await _context.Usuarios.FirstOrDefaultAsync(u => u.ResponsavelId == responsavel.Id);
+            if (usuario != null)
+            {
+                usuario.Email = atualizado.Email;
+
+                if (!string.IsNullOrWhiteSpace(atualizado.Senha))
+                {
+                    usuario.SenhaHash = _passwordHasher.HashPassword(usuario, atualizado.Senha);
+                }
+            }
+
+            await _context.SaveChangesAsync();
+
+            TempData["Sucesso"] = "ResponsÃ¡vel atualizado com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+
+        public async Task<IActionResult> Delete(int id)
+        {
+            var r = await _context.Responsaveis.FindAsync(id);
+            if (r == null) return NotFound();
+            return View(r);
+        }
+
+        [HttpPost, ActionName("Delete")]
+        public async Task<IActionResult> DeleteConfirmed(int id)
+        {
+            var r = await _context.Responsaveis.FindAsync(id);
+            if (r != null)
+            {
+                _context.Responsaveis.Remove(r);
+                await _context.SaveChangesAsync();
+            }
+            TempData["Sucesso"] = "ResponsÃ¡vel removido com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+    }
+}
+using System.Text.Json.Serialization;
+using MongoDB.Bson;
+using MongoDB.Bson.Serialization.Attributes;
+
+namespace YourPetHealth.Models
+{
+    public class TelemetriaPet
+    {
+        [BsonId]
+        [BsonRepresentation(BsonType.ObjectId)]
+        [BsonIgnoreIfDefault]
+        [JsonIgnore]
+        public string? Id { get; set; }
+
+        public int PetId { get; set; }
+
+        public double BatimentosCardiacos { get; set; }
+
+        public double Temperatura { get; set; }
+
+        public string StatusGeral { get; set; } = string.Empty;
+
+        public DateTime DataLeitura { get; set; } = DateTime.UtcNow;
+    }
+}
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using YourPetHealth.Data;
+using YourPetHealth.Models;
+
+namespace YourPetHealth.Controllers
+{
+    [Authorize]
+    public class VeterinariosController : Controller
+    {
+        private readonly AppDbContext _context;
+        private readonly IPasswordHasher<Usuario> _passwordHasher;
+
+        public VeterinariosController(AppDbContext context, IPasswordHasher<Usuario> passwordHasher)
+        {
+            _context = context;
+            _passwordHasher = passwordHasher;
+        }
+
+        public async Task<IActionResult> Index()
+            => View(await _context.Veterinarios.ToListAsync());
+
+        [AllowAnonymous]
+        public IActionResult Create() => RedirectToAction("Register", "Auth");
+
+        [AllowAnonymous]
+        [HttpPost]
+        public async Task<IActionResult> Create(Veterinario v)
+        {
+            if (string.IsNullOrWhiteSpace(v.Senha))
+            {
+                ModelState.AddModelError("Senha", "Senha Ã© obrigatÃ³ria.");
+            }
+
+            if (!ModelState.IsValid) return View(v);
+
+            var emailExistente = await _context.Veterinarios.AnyAsync(x => x.Email == v.Email);
+            if (emailExistente)
+            {
+                ModelState.AddModelError("Email", "Email jÃ¡ cadastrado.");
+                return View(v);
+            }
+
+            var crmvExistente = await _context.Veterinarios.AnyAsync(x => x.Crmv == v.Crmv);
+            if (crmvExistente)
+            {
+                ModelState.AddModelError("Crmv", "CRMV jÃ¡ cadastrado.");
+                return View(v);
+            }
+
+            using var transaction = await _context.Database.BeginTransactionAsync();
+
+            _context.Veterinarios.Add(v);
+            await _context.SaveChangesAsync();
+
+            var usuario = new Usuario
+            {
+                Email = v.Email,
+                Perfil = PerfilUsuario.Veterinario,
+                VeterinarioId = v.Id,
+                Ativo = true,
+                CriadoEm = DateTime.UtcNow
+            };
+            usuario.SenhaHash = _passwordHasher.HashPassword(usuario, v.Senha!);
+
+            _context.Usuarios.Add(usuario);
+            await _context.SaveChangesAsync();
+
+            await transaction.CommitAsync();
+
+            TempData["Sucesso"] = "VeterinÃ¡rio cadastrado com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+
+        [Authorize(Roles = "VETERINARIO,ADMIN")]
+        public async Task<IActionResult> Edit(int id)
+        {
+            var v = await _context.Veterinarios.FindAsync(id);
+            if (v == null) return NotFound();
+            return View(v);
+        }
+
+        [Authorize(Roles = "VETERINARIO,ADMIN")]
+        [HttpPost]
+        public async Task<IActionResult> Edit(Veterinario atualizado)
+        {
+            if (!ModelState.IsValid) return View(atualizado);
+
+            var veterinario = await _context.Veterinarios.FindAsync(atualizado.Id);
+            if (veterinario == null) return NotFound();
+
+            veterinario.Nome = atualizado.Nome;
+            veterinario.Email = atualizado.Email;
+            veterinario.Telefone = atualizado.Telefone;
+            veterinario.Crmv = atualizado.Crmv;
+            veterinario.Especialidade = atualizado.Especialidade;
+
+            var usuario = await _context.Usuarios.FirstOrDefaultAsync(u => u.VeterinarioId == veterinario.Id);
+            if (usuario != null)
+            {
+                usuario.Email = atualizado.Email;
+
+                if (!string.IsNullOrWhiteSpace(atualizado.Senha))
+                {
+                    usuario.SenhaHash = _passwordHasher.HashPassword(usuario, atualizado.Senha);
+                }
+            }
+
+            await _context.SaveChangesAsync();
+
+            TempData["Sucesso"] = "VeterinÃ¡rio atualizado com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+
+        [Authorize(Roles = "VETERINARIO,ADMIN")]
+        public async Task<IActionResult> Delete(int id)
+        {
+            var v = await _context.Veterinarios.FindAsync(id);
+            if (v == null) return NotFound();
+            return View(v);
+        }
+
+        [Authorize(Roles = "VETERINARIO,ADMIN")]
+        [HttpPost, ActionName("Delete")]
+        public async Task<IActionResult> DeleteConfirmed(int id)
+        {
+            var v = await _context.Veterinarios.FindAsync(id);
+            if (v != null)
+            {
+                _context.Veterinarios.Remove(v);
+                await _context.SaveChangesAsync();
+            }
+            TempData["Sucesso"] = "VeterinÃ¡rio removido com sucesso!";
+            return RedirectToAction(nameof(Index));
+        }
+    }
+}
+using Microsoft.EntityFrameworkCore;
+using YourPetHealth.Models;
+
+namespace YourPetHealth.Data
+{
+    public class AppDbContext : DbContext
+    {
+        public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+        public DbSet<Responsavel> Responsaveis { get; set; }
+        public DbSet<Veterinario> Veterinarios { get; set; }
+        public DbSet<Pet> Pets { get; set; }
+        public DbSet<Consulta> Consultas { get; set; }
+        public DbSet<HistoricoClinico> HistoricosClinicos { get; set; }
+        public DbSet<Usuario> Usuarios { get; set; }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+
+            modelBuilder.Entity<Responsavel>()
+                .Property(r => r.Id)
+                .ValueGeneratedOnAdd();
+
+            modelBuilder.Entity<Veterinario>()
+                .Property(v => v.Id)
+                .ValueGeneratedOnAdd();
+
+            modelBuilder.Entity<Pet>()
+                .Property(p => p.Id)
+                .ValueGeneratedOnAdd();
+
+            modelBuilder.Entity<Consulta>()
+                .Property(c => c.Id)
+                .ValueGeneratedOnAdd();
+
+            modelBuilder.Entity<HistoricoClinico>()
+                .Property(h => h.Id)
+                .ValueGeneratedOnAdd();
+
+            modelBuilder.Entity<Usuario>()
+                .Property(u => u.Id)
+                .ValueGeneratedOnAdd();
+
+            modelBuilder.Entity<Responsavel>()
+                .HasIndex(r => r.Email)
+                .IsUnique()
+                .HasDatabaseName("UQ_RESPONSAVEL_EMAIL");
+
+            modelBuilder.Entity<Veterinario>()
+                .HasIndex(v => v.Email)
+                .IsUnique()
+                .HasDatabaseName("UQ_VETERINARIO_EMAIL");
+
+            modelBuilder.Entity<Veterinario>()
+                .HasIndex(v => v.Crmv)
+                .IsUnique()
+                .HasDatabaseName("UQ_VETERINARIO_CRMV");
+
+            if (Database.IsRelational())
+            {
+                modelBuilder.Entity<Pet>().ToTable(tb =>
+                    tb.HasCheckConstraint("CK_PET_SEXO", "SEXO_PET IN ('MACHO','FEMEA')"));
+
+                modelBuilder.Entity<Consulta>().ToTable(tb =>
+                {
+                    tb.HasCheckConstraint("CK_CONSULTA_STATUS", "STATUS IN ('AGENDADA','REALIZADA','CANCELADA')");
+                    tb.HasCheckConstraint("CK_CONSULTA_TIPO", "TIPO IN ('ROTINA','VACINACAO','EMERGENCIA','RETORNO','EXAME')");
+                });
+
+                modelBuilder.Entity<Usuario>().ToTable(tb =>
+                {
+                    tb.HasCheckConstraint("CK_USUARIO_PERFIL",
+                        "PERFIL IN ('RESPONSAVEL','VETERINARIO','ADMIN')");
+
+                    tb.HasCheckConstraint("CK_USUARIO_VINCULO",
+                        "(PERFIL = 'RESPONSAVEL' AND RESPONSAVEL_ID IS NOT NULL AND VETERINARIO_ID IS NULL) " +
+                        "OR (PERFIL = 'VETERINARIO' AND VETERINARIO_ID IS NOT NULL AND RESPONSAVEL_ID IS NULL) " +
+                        "OR (PERFIL = 'ADMIN' AND RESPONSAVEL_ID IS NULL AND VETERINARIO_ID IS NULL)");
+                });
+            }
+
+            modelBuilder.Entity<Pet>()
+                .HasOne(p => p.Responsavel)
+                .WithMany(r => r.Pets)
+                .HasForeignKey(p => p.ResponsavelId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            modelBuilder.Entity<Consulta>()
+                .HasOne(c => c.Pet)
+                .WithMany(p => p.Consultas)
+                .HasForeignKey(c => c.PetId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            modelBuilder.Entity<Consulta>()
+                .HasOne(c => c.Veterinario)
+                .WithMany(v => v.Consultas)
+                .HasForeignKey(c => c.VeterinarioId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            modelBuilder.Entity<HistoricoClinico>()
+                .HasOne(h => h.Pet)
+                .WithMany(p => p.Historicos)
+                .HasForeignKey(h => h.PetId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            modelBuilder.Entity<Usuario>()
+                .HasIndex(u => u.Email)
+                .IsUnique()
+                .HasDatabaseName("UK_USUARIO_EMAIL");
+
+            modelBuilder.Entity<Usuario>()
+                .HasIndex(u => u.ResponsavelId)
+                .IsUnique()
+                .HasDatabaseName("UK_USUARIO_RESPONSAVEL");
+
+            modelBuilder.Entity<Usuario>()
+                .HasIndex(u => u.VeterinarioId)
+                .IsUnique()
+                .HasDatabaseName("UK_USUARIO_VETERINARIO");
+
+            modelBuilder.Entity<Usuario>()
+                .HasOne(u => u.Responsavel)
+                .WithOne(r => r.Usuario)
+                .HasForeignKey<Usuario>(u => u.ResponsavelId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            modelBuilder.Entity<Usuario>()
+                .HasOne(u => u.Veterinario)
+                .WithOne(v => v.Usuario)
+                .HasForeignKey<Usuario>(u => u.VeterinarioId)
+                .OnDelete(DeleteBehavior.Cascade);
+        }
+    }
+}
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Design;
+using Microsoft.Extensions.Configuration;
+using System.IO;
+
+namespace YourPetHealth.Data
+{
+    public class AppDbContextFactory : IDesignTimeDbContextFactory<AppDbContext>
+    {
+        public AppDbContext CreateDbContext(string[] args)
+        {
+            var configuration = new ConfigurationBuilder()
+                .SetBasePath(Directory.GetCurrentDirectory())
+                .AddJsonFile("appsettings.json")
+                .Build();
+
+            var builder = new DbContextOptionsBuilder<AppDbContext>();
+            var connectionString = configuration.GetConnectionString("OracleConnection");
+
+            builder.UseOracle(connectionString, oracleOptions =>
+                oracleOptions.UseOracleSQLCompatibility(OracleSQLCompatibility.DatabaseVersion19));
+
+            return new AppDbContext(builder.Options);
+        }
+    }
+}
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
+
+namespace YourPetHealth.Diagnostics
+{
+    public static class AppDiagnostics
+    {
+        public const string ServiceName = "YourPetHealth";
+
+        public static readonly ActivitySource ActivitySource = new(ServiceName);
+
+        private static readonly Meter Meter = new(ServiceName);
+
+        public static readonly Counter<long> LoginsRealizados =
+            Meter.CreateCounter<long>("yourpethealth.logins.total", description: "Total de logins bem-sucedidos");
+
+        public static readonly Counter<long> LoginsFalhos =
+            Meter.CreateCounter<long>("yourpethealth.logins.falhos.total", description: "Total de tentativas de login com falha");
+
+        public static readonly Counter<long> CadastrosResponsavel =
+            Meter.CreateCounter<long>("yourpethealth.responsaveis.cadastrados.total", description: "Total de responsÃ¡veis cadastrados");
+    }
+}
+using System.Security.Claims;
+
+namespace YourPetHealth.Extensions
+{
+    public static class ClaimsPrincipalExtensions
+    {
+        public static int? GetEntidadeId(this ClaimsPrincipal user)
+        {
+            var valor = user.FindFirst("EntidadeId")?.Value;
+            return int.TryParse(valor, out var id) ? id : null;
+        }
+    }
+}
+using System.Diagnostics;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+
+namespace YourPetHealth.HealthChecks
+{
+    public class ExternalServiceHealthCheck : IHealthCheck
+    {
+        private readonly HttpClient _httpClient;
+        private readonly IConfiguration _configuration;
+
+        public ExternalServiceHealthCheck(HttpClient httpClient, IConfiguration configuration)
+        {
+            _httpClient = httpClient;
+            _configuration = configuration;
+        }
+
+        public async Task<HealthCheckResult> CheckHealthAsync(
+            HealthCheckContext context,
+            CancellationToken cancellationToken = default)
+        {
+            var url = _configuration["HealthChecks:ExternalServiceUrl"];
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return HealthCheckResult.Healthy("Nenhum serviÃ§o externo configurado para checagem.");
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                using var response = await _httpClient.GetAsync(url, cancellationToken);
+                stopwatch.Stop();
+
+                var data = new Dictionary<string, object>
+                {
+                    ["url"] = url,
+                    ["statusCode"] = (int)response.StatusCode,
+                    ["responseTimeMs"] = stopwatch.ElapsedMilliseconds
+                };
+
+                return response.IsSuccessStatusCode
+                    ? HealthCheckResult.Healthy($"ServiÃ§o externo respondeu {(int)response.StatusCode}.", data)
+                    : HealthCheckResult.Degraded($"ServiÃ§o externo respondeu {(int)response.StatusCode}.", data: data);
+            }
+            catch (Exception ex)
+            {
+                return HealthCheckResult.Unhealthy($"NÃ£o foi possÃ­vel acessar {url}.", ex);
+            }
+        }
+    }
+}
+using System.Text.Json;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+
+namespace YourPetHealth.HealthChecks
+{
+
+    public static class HealthCheckResponseWriter
+    {
+        public static Task WriteResponse(HttpContext context, HealthReport report)
+        {
+            context.Response.ContentType = "application/json; charset=utf-8";
+
+            var payload = new
+            {
+                status = report.Status.ToString(),
+                totalDurationMs = report.TotalDuration.TotalMilliseconds,
+                checks = report.Entries.Select(e => new
+                {
+                    name = e.Key,
+                    status = e.Value.Status.ToString(),
+                    description = e.Value.Description,
+                    durationMs = e.Value.Duration.TotalMilliseconds,
+                    error = e.Value.Exception?.Message,
+                    data = e.Value.Data.Count > 0 ? e.Value.Data : null
+                })
+            };
+
+            var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
+            {
+                WriteIndented = true
+            });
+
+            return context.Response.WriteAsync(json);
+        }
+    }
+}
+using System.Diagnostics;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using YourPetHealth.Data;
+
+namespace YourPetHealth.HealthChecks
+{
+    
+    public class OracleDatabaseHealthCheck : IHealthCheck
+    {
+        private readonly AppDbContext _context;
+
+        public OracleDatabaseHealthCheck(AppDbContext context)
+        {
+            _context = context;
+        }
+
+        public async Task<HealthCheckResult> CheckHealthAsync(
+            HealthCheckContext context,
+            CancellationToken cancellationToken = default)
+        {
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                var podeConectar = await _context.Database.CanConnectAsync(cancellationToken);
+                if (!podeConectar)
+                {
+                    return HealthCheckResult.Unhealthy("NÃ£o foi possÃ­vel abrir conexÃ£o com o Oracle.");
+                }
+
+                await _context.Database.ExecuteSqlRawAsync("SELECT 1 FROM DUAL", cancellationToken);
+
+                stopwatch.Stop();
+                var data = new Dictionary<string, object>
+                {
+                    ["responseTimeMs"] = stopwatch.ElapsedMilliseconds,
+                    ["dataSource"] = _context.Database.GetDbConnection().DataSource
+                };
+
+                return stopwatch.ElapsedMilliseconds > 1000
+                    ? HealthCheckResult.Degraded("Oracle respondeu, mas acima de 1s.", data: data)
+                    : HealthCheckResult.Healthy("ConexÃ£o com o Oracle OK.", data);
+            }
+            catch (Exception ex)
+            {
+                return HealthCheckResult.Unhealthy("Falha ao conectar no Oracle.", ex);
+            }
+        }
+    }
+}
+using Serilog.Context;
+
+namespace YourPetHealth.Middleware
+{
+    
+    public class CorrelationIdMiddleware
+    {
+        private const string HeaderName = "X-Correlation-Id";
+        private readonly RequestDelegate _next;
+
+        public CorrelationIdMiddleware(RequestDelegate next)
+        {
+            _next = next;
+        }
+
+        public async Task InvokeAsync(HttpContext context)
+        {
+            var correlationId = context.Request.Headers.TryGetValue(HeaderName, out var existing)
+                ? existing.ToString()
+                : Guid.NewGuid().ToString("N");
+
+            context.Response.Headers[HeaderName] = correlationId;
+
+            using (LogContext.PushProperty("CorrelationId", correlationId))
+            {
+                await _next(context);
+            }
+        }
+    }
+}
+using Microsoft.EntityFrameworkCore.Migrations;
+
+#nullable disable
+
+namespace YourPetHealth.Migrations
+{
+    public partial class InitialCreate : Migration
+    {
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.CreateTable(
+                name: "T_RESPONSAVEIS",
+                columns: table => new
+                {
+                    ID = table.Column<int>(type: "NUMBER(10)", nullable: false)
+                        .Annotation("Oracle:Identity", "START WITH 1 INCREMENT BY 1"),
+                    NOME = table.Column<string>(type: "VARCHAR2(100)", maxLength: 100, nullable: false),
+                    EMAIL = table.Column<string>(type: "VARCHAR2(150)", maxLength: 150, nullable: false),
+                    SENHA = table.Column<string>(type: "VARCHAR2(255)", maxLength: 255, nullable: false),
+                    TELEFONE = table.Column<string>(type: "VARCHAR2(20)", maxLength: 20, nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_T_RESPONSAVEIS", x => x.ID);
+                    table.UniqueConstraint("UQ_RESPONSAVEL_EMAIL", x => x.EMAIL);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "T_VETERINARIOS",
+                columns: table => new
+                {
+                    ID = table.Column<int>(type: "NUMBER(10)", nullable: false)
+                        .Annotation("Oracle:Identity", "START WITH 1 INCREMENT BY 1"),
+                    NOME = table.Column<string>(type: "VARCHAR2(100)", maxLength: 100, nullable: false),
+                    EMAIL = table.Column<string>(type: "VARCHAR2(150)", maxLength: 150, nullable: false),
+                    SENHA = table.Column<string>(type: "VARCHAR2(255)", maxLength: 255, nullable: false),
+                    TELEFONE = table.Column<string>(type: "VARCHAR2(20)", maxLength: 20, nullable: true),
+                    CRMV = table.Column<string>(type: "VARCHAR2(30)", maxLength: 30, nullable: false),
+                    ESPECIALIDADE = table.Column<string>(type: "VARCHAR2(100)", maxLength: 100, nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_T_VETERINARIOS", x => x.ID);
+                    table.UniqueConstraint("UQ_VETERINARIO_EMAIL", x => x.EMAIL);
+                    table.UniqueConstraint("UQ_VETERINARIO_CRMV", x => x.CRMV);
+                });
+
+            migrationBuilder.CreateTable(
+                name: "T_PETS",
+                columns: table => new
+                {
+                    ID = table.Column<int>(type: "NUMBER(10)", nullable: false)
+                        .Annotation("Oracle:Identity", "START WITH 1 INCREMENT BY 1"),
+                    RESPONSAVEL_ID = table.Column<int>(type: "NUMBER(10)", nullable: false),
+                    NOME = table.Column<string>(type: "VARCHAR2(100)", maxLength: 100, nullable: false),
+                    RACA = table.Column<string>(type: "VARCHAR2(100)", maxLength: 100, nullable: true),
+                    IDADE = table.Column<int>(type: "NUMBER(10)", nullable: true),
+                    PESO = table.Column<decimal>(type: "NUMBER(5,2)", nullable: true),
+                    SEXO = table.Column<string>(type: "VARCHAR2(20)", maxLength: 20, nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_T_PETS", x => x.ID);
+                    table.ForeignKey(
+                        name: "FK_PET_RESPONSAVEL",
+                        column: x => x.RESPONSAVEL_ID,
+                        principalTable: "T_RESPONSAVEIS",
+                        principalColumn: "ID",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            
+            migrationBuilder.Sql("ALTER TABLE T_PETS ADD CONSTRAINT CK_PET_SEXO CHECK (SEXO IN ('MACHO','FEMEA'))");
+
+            migrationBuilder.CreateTable(
+                name: "T_CONSULTAS",
+                columns: table => new
+                {
+                    ID = table.Column<int>(type: "NUMBER(10)", nullable: false)
+                        .Annotation("Oracle:Identity", "START WITH 1 INCREMENT BY 1"),
+                    PET_ID = table.Column<int>(type: "NUMBER(10)", nullable: false),
+                    VETERINARIO_ID = table.Column<int>(type: "NUMBER(10)", nullable: false),
+                    TIPO = table.Column<string>(type: "VARCHAR2(100)", maxLength: 100, nullable: false),
+                    DESCRICAO = table.Column<string>(type: "VARCHAR2(1000)", maxLength: 1000, nullable: true),
+                    DATA = table.Column<DateTime>(type: "DATE", nullable: false),
+                    OBSERVACOES = table.Column<string>(type: "VARCHAR2(1000)", maxLength: 1000, nullable: true),
+                    STATUS = table.Column<string>(type: "VARCHAR2(30)", maxLength: 30, nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_T_CONSULTAS", x => x.ID);
+                    table.ForeignKey(
+                        name: "FK_CONSULTA_PET",
+                        column: x => x.PET_ID,
+                        principalTable: "T_PETS",
+                        principalColumn: "ID",
+                        onDelete: ReferentialAction.Cascade);
+                    table.ForeignKey(
+                        name: "FK_CONSULTA_VETERINARIO",
+                        column: x => x.VETERINARIO_ID,
+                        principalTable: "T_VETERINARIOS",
+                        principalColumn: "ID",
+                        onDelete: ReferentialAction.Restrict);
+                });
+
+            migrationBuilder.Sql("ALTER TABLE T_CONSULTAS ADD CONSTRAINT CK_CONSULTA_STATUS CHECK (STATUS IN ('AGENDADA','REALIZADA','CANCELADA'))");
+
+            migrationBuilder.CreateTable(
+                name: "T_HISTORICO_CLINICO",
+                columns: table => new
+                {
+                    ID = table.Column<int>(type: "NUMBER(10)", nullable: false)
+                        .Annotation("Oracle:Identity", "START WITH 1 INCREMENT BY 1"),
+                    PET_ID = table.Column<int>(type: "NUMBER(10)", nullable: false),
+                    TIPO = table.Column<string>(type: "VARCHAR2(50)", maxLength: 50, nullable: false),
+                    DESCRICAO = table.Column<string>(type: "VARCHAR2(1000)", maxLength: 1000, nullable: true),
+                    DATA = table.Column<DateTime>(type: "DATE", nullable: false)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_T_HISTORICO_CLINICO", x => x.ID);
+                    table.ForeignKey(
+                        name: "FK_HISTORICO_PET",
+                        column: x => x.PET_ID,
+                        principalTable: "T_PETS",
+                        principalColumn: "ID",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.Sql("ALTER TABLE T_HISTORICO_CLINICO ADD CONSTRAINT CK_HISTORICO_TIPO CHECK (TIPO IN ('CONSULTA'))");
+
+            migrationBuilder.CreateIndex("IX_T_PETS_RESPONSAVEL_ID", "T_PETS", "RESPONSAVEL_ID");
+            migrationBuilder.CreateIndex("IX_T_CONSULTAS_PET_ID", "T_CONSULTAS", "PET_ID");
+            migrationBuilder.CreateIndex("IX_T_CONSULTAS_VETERINARIO_ID", "T_CONSULTAS", "VETERINARIO_ID");
+            migrationBuilder.CreateIndex("IX_T_HISTORICO_PET_ID", "T_HISTORICO_CLINICO", "PET_ID");
+        }
+
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.DropTable(name: "T_HISTORICO_CLINICO");
+            migrationBuilder.DropTable(name: "T_CONSULTAS");
+            migrationBuilder.DropTable(name: "T_PETS");
+            migrationBuilder.DropTable(name: "T_VETERINARIOS");
+            migrationBuilder.DropTable(name: "T_RESPONSAVEIS");
+        }
+    }
+}
+// <auto-generated />
+using System;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using Oracle.EntityFrameworkCore.Metadata;
+using YourPetHealth.Data;
+
+#nullable disable
+
+namespace YourPetHealth.Migrations
+{
+    [DbContext(typeof(AppDbContext))]
+    [Migration("20260605185312_InitialCreate")]
+    partial class InitialCreate
+    {
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("ProductVersion", "8.0.27")
+                .HasAnnotation("Relational:MaxIdentifierLength", 128);
+
+            OracleModelBuilderExtensions.UseIdentityColumns(modelBuilder);
+
+            modelBuilder.Entity("YourPetHealth.Models.Consulta", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("Data")
+                        .HasColumnType("DATE")
+                        .HasColumnName("DATA");
+
+                    b.Property<string>("Descricao")
+                        .HasMaxLength(1000)
+                        .HasColumnType("VARCHAR2(1000)")
+                        .HasColumnName("DESCRICAO");
+
+                    b.Property<string>("Observacoes")
+                        .HasMaxLength(1000)
+                        .HasColumnType("VARCHAR2(1000)")
+                        .HasColumnName("OBSERVACOES");
+
+                    b.Property<int>("PetId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("PET_ID");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(30)
+                        .HasColumnType("VARCHAR2(30)")
+                        .HasColumnName("STATUS");
+
+                    b.Property<string>("Tipo")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("VARCHAR2(100)")
+                        .HasColumnName("TIPO");
+
+                    b.Property<int>("VeterinarioId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("VETERINARIO_ID");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("PetId");
+
+                    b.HasIndex("VeterinarioId");
+
+                    b.ToTable("T_CONSULTAS", t =>
+                        {
+                            t.HasCheckConstraint("CK_CONSULTA_STATUS", "STATUS IN ('AGENDADA', 'REALIZADA', 'CANCELADA')");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.HistoricoClinico", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("Data")
+                        .HasColumnType("DATE")
+                        .HasColumnName("DATA");
+
+                    b.Property<string>("Descricao")
+                        .HasMaxLength(1000)
+                        .HasColumnType("VARCHAR2(1000)")
+                        .HasColumnName("DESCRICAO");
+
+                    b.Property<int>("PetId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("PET_ID");
+
+                    b.Property<string>("Tipo")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("VARCHAR2(50)")
+                        .HasColumnName("TIPO");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("PetId");
+
+                    b.ToTable("T_HISTORICO_CLINICO", t =>
+                        {
+                            t.HasCheckConstraint("CK_HISTORICO_TIPO", "TIPO IN ('CONSULTA')");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Pet", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<int?>("Idade")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("IDADE");
+
+                    b.Property<string>("Nome")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("VARCHAR2(100)")
+                        .HasColumnName("NOME");
+
+                    b.Property<decimal?>("Peso")
+                        .HasColumnType("NUMBER(5,2)")
+                        .HasColumnName("PESO");
+
+                    b.Property<string>("Raca")
+                        .HasMaxLength(100)
+                        .HasColumnType("VARCHAR2(100)")
+                        .HasColumnName("RACA");
+
+                    b.Property<int>("ResponsavelId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("RESPONSAVEL_ID");
+
+                    b.Property<string>("Sexo")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("VARCHAR2(20)")
+                        .HasColumnName("SEXO");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ResponsavelId");
+
+                    b.ToTable("T_PETS", t =>
+                        {
+                            t.HasCheckConstraint("CK_PET_SEXO", "SEXO IN ('MACHO', 'FEMEA')");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Responsavel", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(150)
+                        .HasColumnType("VARCHAR2(150)")
+                        .HasColumnName("EMAIL");
+
+                    b.Property<string>("Nome")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("VARCHAR2(100)")
+                        .HasColumnName("NOME");
+
+                    b.Property<string>("Senha")
+                        .IsRequired()
+                        .HasMaxLength(255)
+                        .HasColumnType("VARCHAR2(255)")
+                        .HasColumnName("SENHA");
+
+                    b.Property<string>("Telefone")
+                        .HasMaxLength(20)
+                        .HasColumnType("VARCHAR2(20)")
+                        .HasColumnName("TELEFONE");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("T_RESPONSAVEIS");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Veterinario", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Crmv")
+                        .IsRequired()
+                        .HasMaxLength(30)
+                        .HasColumnType("VARCHAR2(30)")
+                        .HasColumnName("CRMV");
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(150)
+                        .HasColumnType("VARCHAR2(150)")
+                        .HasColumnName("EMAIL");
+
+                    b.Property<string>("Especialidade")
+                        .HasMaxLength(100)
+                        .HasColumnType("VARCHAR2(100)")
+                        .HasColumnName("ESPECIALIDADE");
+
+                    b.Property<string>("Nome")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("VARCHAR2(100)")
+                        .HasColumnName("NOME");
+
+                    b.Property<string>("Senha")
+                        .IsRequired()
+                        .HasMaxLength(255)
+                        .HasColumnType("VARCHAR2(255)")
+                        .HasColumnName("SENHA");
+
+                    b.Property<string>("Telefone")
+                        .HasMaxLength(20)
+                        .HasColumnType("VARCHAR2(20)")
+                        .HasColumnName("TELEFONE");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("T_VETERINARIOS");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Consulta", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Pet", "Pet")
+                        .WithMany("Consultas")
+                        .HasForeignKey("PetId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("YourPetHealth.Models.Veterinario", "Veterinario")
+                        .WithMany("Consultas")
+                        .HasForeignKey("VeterinarioId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Pet");
+
+                    b.Navigation("Veterinario");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.HistoricoClinico", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Pet", "Pet")
+                        .WithMany("Historicos")
+                        .HasForeignKey("PetId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Pet");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Pet", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Responsavel", "Responsavel")
+                        .WithMany("Pets")
+                        .HasForeignKey("ResponsavelId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Responsavel");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Pet", b =>
+                {
+                    b.Navigation("Consultas");
+
+                    b.Navigation("Historicos");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Responsavel", b =>
+                {
+                    b.Navigation("Pets");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Veterinario", b =>
+                {
+                    b.Navigation("Consultas");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+using System;
+using Microsoft.EntityFrameworkCore.Migrations;
+
+#nullable disable
+
+namespace YourPetHealth.Migrations
+{
+    public partial class MigrateToYpSchemaAndAuth : Migration
+    {
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.RenameTable(name: "T_RESPONSAVEIS", newName: "YP_T_RESPONSAVEIS");
+            migrationBuilder.RenameTable(name: "T_VETERINARIOS", newName: "YP_T_VETERINARIOS");
+            migrationBuilder.RenameTable(name: "T_PETS", newName: "YP_T_PETS");
+            migrationBuilder.RenameTable(name: "T_CONSULTAS", newName: "YP_T_CONSULTAS");
+            migrationBuilder.RenameTable(name: "T_HISTORICO_CLINICO", newName: "YP_T_HISTORICO_CLINICO");
+
+            migrationBuilder.RenameColumn(name: "SEXO", table: "YP_T_PETS", newName: "SEXO_PET");
+
+            migrationBuilder.DropColumn(name: "SENHA", table: "YP_T_RESPONSAVEIS");
+            migrationBuilder.DropColumn(name: "SENHA", table: "YP_T_VETERINARIOS");
+
+           
+            migrationBuilder.Sql("ALTER TABLE YP_T_CONSULTAS ADD CONSTRAINT CK_CONSULTA_TIPO CHECK (TIPO IN ('ROTINA','VACINACAO','EMERGENCIA','RETORNO','EXAME'))");
+
+            migrationBuilder.CreateTable(
+                name: "YP_T_USUARIOS",
+                columns: table => new
+                {
+                    ID = table.Column<int>(type: "NUMBER(10)", nullable: false)
+                        .Annotation("Oracle:Identity", "START WITH 1 INCREMENT BY 1"),
+                    EMAIL = table.Column<string>(type: "NVARCHAR2(150)", maxLength: 150, nullable: false),
+                    SENHA_HASH = table.Column<string>(type: "NVARCHAR2(255)", maxLength: 255, nullable: false),
+                    PERFIL = table.Column<string>(type: "NVARCHAR2(20)", maxLength: 20, nullable: false),
+                    ATIVO = table.Column<bool>(type: "NUMBER(1)", nullable: false, defaultValue: true),
+                    CRIADO_EM = table.Column<DateTime>(type: "TIMESTAMP(7)", nullable: false, defaultValueSql: "SYSTIMESTAMP"),
+                    RESPONSAVEL_ID = table.Column<int>(type: "NUMBER(10)", nullable: true),
+                    VETERINARIO_ID = table.Column<int>(type: "NUMBER(10)", nullable: true)
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_YP_T_USUARIOS", x => x.ID);
+
+                    table.ForeignKey(
+                        name: "FK_USUARIO_RESPONSAVEL",
+                        column: x => x.RESPONSAVEL_ID,
+                        principalTable: "YP_T_RESPONSAVEIS",
+                        principalColumn: "ID",
+                        onDelete: ReferentialAction.Cascade);
+
+                    table.ForeignKey(
+                        name: "FK_USUARIO_VETERINARIO",
+                        column: x => x.VETERINARIO_ID,
+                        principalTable: "YP_T_VETERINARIOS",
+                        principalColumn: "ID",
+                        onDelete: ReferentialAction.Cascade);
+                });
+
+            migrationBuilder.Sql(
+                "ALTER TABLE YP_T_USUARIOS ADD CONSTRAINT CK_USUARIO_PERFIL " +
+                "CHECK (PERFIL IN ('RESPONSAVEL','VETERINARIO','ADMIN'))");
+
+            migrationBuilder.Sql(
+                "ALTER TABLE YP_T_USUARIOS ADD CONSTRAINT CK_USUARIO_VINCULO CHECK (" +
+                "(PERFIL = 'RESPONSAVEL' AND RESPONSAVEL_ID IS NOT NULL AND VETERINARIO_ID IS NULL) " +
+                "OR (PERFIL = 'VETERINARIO' AND VETERINARIO_ID IS NOT NULL AND RESPONSAVEL_ID IS NULL) " +
+                "OR (PERFIL = 'ADMIN' AND RESPONSAVEL_ID IS NULL AND VETERINARIO_ID IS NULL))");
+
+            migrationBuilder.CreateIndex(
+                name: "UK_USUARIO_EMAIL",
+                table: "YP_T_USUARIOS",
+                column: "EMAIL",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "UK_USUARIO_RESPONSAVEL",
+                table: "YP_T_USUARIOS",
+                column: "RESPONSAVEL_ID",
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "UK_USUARIO_VETERINARIO",
+                table: "YP_T_USUARIOS",
+                column: "VETERINARIO_ID",
+                unique: true);
+        }
+
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.DropTable(name: "YP_T_USUARIOS");
+
+            migrationBuilder.DropCheckConstraint(name: "CK_CONSULTA_TIPO", table: "YP_T_CONSULTAS");
+
+            migrationBuilder.AddColumn<string>(
+                name: "SENHA",
+                table: "YP_T_VETERINARIOS",
+                type: "NVARCHAR2(255)",
+                maxLength: 255,
+                nullable: false,
+                defaultValue: "");
+
+            migrationBuilder.AddColumn<string>(
+                name: "SENHA",
+                table: "YP_T_RESPONSAVEIS",
+                type: "NVARCHAR2(255)",
+                maxLength: 255,
+                nullable: false,
+                defaultValue: "");
+
+            migrationBuilder.RenameColumn(name: "SEXO_PET", table: "YP_T_PETS", newName: "SEXO");
+
+            migrationBuilder.RenameTable(name: "YP_T_HISTORICO_CLINICO", newName: "T_HISTORICO_CLINICO");
+            migrationBuilder.RenameTable(name: "YP_T_CONSULTAS", newName: "T_CONSULTAS");
+            migrationBuilder.RenameTable(name: "YP_T_PETS", newName: "T_PETS");
+            migrationBuilder.RenameTable(name: "YP_T_VETERINARIOS", newName: "T_VETERINARIOS");
+            migrationBuilder.RenameTable(name: "YP_T_RESPONSAVEIS", newName: "T_RESPONSAVEIS");
+        }
+    }
+}
+// <auto-generated />
+using System;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using Oracle.EntityFrameworkCore.Metadata;
+using YourPetHealth.Data;
+
+#nullable disable
+
+namespace YourPetHealth.Migrations
+{
+    [DbContext(typeof(AppDbContext))]
+    [Migration("20260902000000_MigrateToYpSchemaAndAuth")]
+    partial class MigrateToYpSchemaAndAuth
+    {
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("ProductVersion", "9.0.0")
+                .HasAnnotation("Relational:MaxIdentifierLength", 128);
+
+            OracleModelBuilderExtensions.UseIdentityColumns(modelBuilder);
+
+            modelBuilder.Entity("YourPetHealth.Models.Consulta", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("Data")
+                        .HasColumnType("TIMESTAMP(7)")
+                        .HasColumnName("DATA");
+
+                    b.Property<string>("Descricao")
+                        .HasMaxLength(1000)
+                        .HasColumnType("NVARCHAR2(1000)")
+                        .HasColumnName("DESCRICAO");
+
+                    b.Property<string>("Observacoes")
+                        .HasMaxLength(1000)
+                        .HasColumnType("NVARCHAR2(1000)")
+                        .HasColumnName("OBSERVACOES");
+
+                    b.Property<int>("PetId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("PET_ID");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(30)
+                        .HasColumnType("NVARCHAR2(30)")
+                        .HasColumnName("STATUS");
+
+                    b.Property<string>("Tipo")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("TIPO");
+
+                    b.Property<int>("VeterinarioId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("VETERINARIO_ID");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("PetId");
+
+                    b.HasIndex("VeterinarioId");
+
+                    b.ToTable("YP_T_CONSULTAS", t =>
+                        {
+                            t.HasCheckConstraint("CK_CONSULTA_STATUS", "STATUS IN ('AGENDADA','REALIZADA','CANCELADA')");
+
+                            t.HasCheckConstraint("CK_CONSULTA_TIPO", "TIPO IN ('ROTINA','VACINACAO','EMERGENCIA','RETORNO','EXAME')");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.HistoricoClinico", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("Data")
+                        .HasColumnType("TIMESTAMP(7)")
+                        .HasColumnName("DATA");
+
+                    b.Property<string>("Descricao")
+                        .HasMaxLength(1000)
+                        .HasColumnType("NVARCHAR2(1000)")
+                        .HasColumnName("DESCRICAO");
+
+                    b.Property<int>("PetId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("PET_ID");
+
+                    b.Property<string>("Tipo")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("NVARCHAR2(50)")
+                        .HasColumnName("TIPO");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("PetId");
+
+                    b.ToTable("YP_T_HISTORICO_CLINICO", t =>
+                        {
+                            t.HasCheckConstraint("CK_HISTORICO_TIPO", "TIPO IN ('CONSULTA')");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Pet", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<int?>("Idade")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("IDADE");
+
+                    b.Property<string>("Nome")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("NOME");
+
+                    b.Property<decimal?>("Peso")
+                        .HasColumnType("DECIMAL(18, 2)")
+                        .HasColumnName("PESO");
+
+                    b.Property<string>("Raca")
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("RACA");
+
+                    b.Property<int>("ResponsavelId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("RESPONSAVEL_ID");
+
+                    b.Property<string>("Sexo")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("NVARCHAR2(20)")
+                        .HasColumnName("SEXO_PET");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ResponsavelId");
+
+                    b.ToTable("YP_T_PETS", t =>
+                        {
+                            t.HasCheckConstraint("CK_PET_SEXO", "SEXO_PET IN ('MACHO','FEMEA')");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Responsavel", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(150)
+                        .HasColumnType("NVARCHAR2(150)")
+                        .HasColumnName("EMAIL");
+
+                    b.Property<string>("Nome")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("NOME");
+
+                    b.Property<string>("Telefone")
+                        .HasMaxLength(20)
+                        .HasColumnType("NVARCHAR2(20)")
+                        .HasColumnName("TELEFONE");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Email")
+                        .IsUnique()
+                        .HasDatabaseName("UQ_RESPONSAVEL_EMAIL");
+
+                    b.ToTable("YP_T_RESPONSAVEIS");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Usuario", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<bool>("Ativo")
+                        .HasColumnType("NUMBER(1)")
+                        .HasColumnName("ATIVO");
+
+                    b.Property<DateTime>("CriadoEm")
+                        .HasColumnType("TIMESTAMP(7)")
+                        .HasColumnName("CRIADO_EM");
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(150)
+                        .HasColumnType("NVARCHAR2(150)")
+                        .HasColumnName("EMAIL");
+
+                    b.Property<string>("Perfil")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("NVARCHAR2(20)")
+                        .HasColumnName("PERFIL");
+
+                    b.Property<int?>("ResponsavelId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("RESPONSAVEL_ID");
+
+                    b.Property<string>("SenhaHash")
+                        .IsRequired()
+                        .HasMaxLength(255)
+                        .HasColumnType("NVARCHAR2(255)")
+                        .HasColumnName("SENHA_HASH");
+
+                    b.Property<int?>("VeterinarioId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("VETERINARIO_ID");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Email")
+                        .IsUnique()
+                        .HasDatabaseName("UK_USUARIO_EMAIL");
+
+                    b.HasIndex("ResponsavelId")
+                        .IsUnique()
+                        .HasDatabaseName("UK_USUARIO_RESPONSAVEL");
+
+                    b.HasIndex("VeterinarioId")
+                        .IsUnique()
+                        .HasDatabaseName("UK_USUARIO_VETERINARIO");
+
+                    b.ToTable("YP_T_USUARIOS", t =>
+                        {
+                            t.HasCheckConstraint("CK_USUARIO_PERFIL", "PERFIL IN ('RESPONSAVEL','VETERINARIO','ADMIN')");
+
+                            t.HasCheckConstraint("CK_USUARIO_VINCULO", "(PERFIL = 'RESPONSAVEL' AND RESPONSAVEL_ID IS NOT NULL AND VETERINARIO_ID IS NULL) OR (PERFIL = 'VETERINARIO' AND VETERINARIO_ID IS NOT NULL AND RESPONSAVEL_ID IS NULL) OR (PERFIL = 'ADMIN' AND RESPONSAVEL_ID IS NULL AND VETERINARIO_ID IS NULL)");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Veterinario", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Crmv")
+                        .IsRequired()
+                        .HasMaxLength(30)
+                        .HasColumnType("NVARCHAR2(30)")
+                        .HasColumnName("CRMV");
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(150)
+                        .HasColumnType("NVARCHAR2(150)")
+                        .HasColumnName("EMAIL");
+
+                    b.Property<string>("Especialidade")
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("ESPECIALIDADE");
+
+                    b.Property<string>("Nome")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("NOME");
+
+                    b.Property<string>("Telefone")
+                        .HasMaxLength(20)
+                        .HasColumnType("NVARCHAR2(20)")
+                        .HasColumnName("TELEFONE");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Crmv")
+                        .IsUnique()
+                        .HasDatabaseName("UQ_VETERINARIO_CRMV");
+
+                    b.HasIndex("Email")
+                        .IsUnique()
+                        .HasDatabaseName("UQ_VETERINARIO_EMAIL");
+
+                    b.ToTable("YP_T_VETERINARIOS");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Consulta", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Pet", "Pet")
+                        .WithMany("Consultas")
+                        .HasForeignKey("PetId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("YourPetHealth.Models.Veterinario", "Veterinario")
+                        .WithMany("Consultas")
+                        .HasForeignKey("VeterinarioId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Pet");
+
+                    b.Navigation("Veterinario");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.HistoricoClinico", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Pet", "Pet")
+                        .WithMany("Historicos")
+                        .HasForeignKey("PetId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Pet");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Pet", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Responsavel", "Responsavel")
+                        .WithMany("Pets")
+                        .HasForeignKey("ResponsavelId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Responsavel");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Usuario", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Responsavel", "Responsavel")
+                        .WithOne("Usuario")
+                        .HasForeignKey("YourPetHealth.Models.Usuario", "ResponsavelId")
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    b.HasOne("YourPetHealth.Models.Veterinario", "Veterinario")
+                        .WithOne("Usuario")
+                        .HasForeignKey("YourPetHealth.Models.Usuario", "VeterinarioId")
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    b.Navigation("Responsavel");
+
+                    b.Navigation("Veterinario");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Pet", b =>
+                {
+                    b.Navigation("Consultas");
+
+                    b.Navigation("Historicos");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Responsavel", b =>
+                {
+                    b.Navigation("Pets");
+
+                    b.Navigation("Usuario");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Veterinario", b =>
+                {
+                    b.Navigation("Consultas");
+
+                    b.Navigation("Usuario");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+// <auto-generated />
+using System;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using Oracle.EntityFrameworkCore.Metadata;
+using YourPetHealth.Data;
+
+#nullable disable
+
+namespace YourPetHealth.Migrations
+{
+    [DbContext(typeof(AppDbContext))]
+    partial class AppDbContextModelSnapshot : ModelSnapshot
+    {
+        protected override void BuildModel(ModelBuilder modelBuilder)
+        {
+#pragma warning disable 612, 618
+            modelBuilder
+                .HasAnnotation("ProductVersion", "9.0.0")
+                .HasAnnotation("Relational:MaxIdentifierLength", 128);
+
+            OracleModelBuilderExtensions.UseIdentityColumns(modelBuilder);
+
+            modelBuilder.Entity("YourPetHealth.Models.Consulta", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("Data")
+                        .HasColumnType("TIMESTAMP(7)")
+                        .HasColumnName("DATA");
+
+                    b.Property<string>("Descricao")
+                        .HasMaxLength(1000)
+                        .HasColumnType("NVARCHAR2(1000)")
+                        .HasColumnName("DESCRICAO");
+
+                    b.Property<string>("Observacoes")
+                        .HasMaxLength(1000)
+                        .HasColumnType("NVARCHAR2(1000)")
+                        .HasColumnName("OBSERVACOES");
+
+                    b.Property<int>("PetId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("PET_ID");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(30)
+                        .HasColumnType("NVARCHAR2(30)")
+                        .HasColumnName("STATUS");
+
+                    b.Property<string>("Tipo")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("TIPO");
+
+                    b.Property<int>("VeterinarioId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("VETERINARIO_ID");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("PetId");
+
+                    b.HasIndex("VeterinarioId");
+
+                    b.ToTable("YP_T_CONSULTAS", t =>
+                        {
+                            t.HasCheckConstraint("CK_CONSULTA_STATUS", "STATUS IN ('AGENDADA','REALIZADA','CANCELADA')");
+
+                            t.HasCheckConstraint("CK_CONSULTA_TIPO", "TIPO IN ('ROTINA','VACINACAO','EMERGENCIA','RETORNO','EXAME')");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.HistoricoClinico", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("Data")
+                        .HasColumnType("TIMESTAMP(7)")
+                        .HasColumnName("DATA");
+
+                    b.Property<string>("Descricao")
+                        .HasMaxLength(1000)
+                        .HasColumnType("NVARCHAR2(1000)")
+                        .HasColumnName("DESCRICAO");
+
+                    b.Property<int>("PetId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("PET_ID");
+
+                    b.Property<string>("Tipo")
+                        .IsRequired()
+                        .HasMaxLength(50)
+                        .HasColumnType("NVARCHAR2(50)")
+                        .HasColumnName("TIPO");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("PetId");
+
+                    b.ToTable("YP_T_HISTORICO_CLINICO", t =>
+                        {
+                            t.HasCheckConstraint("CK_HISTORICO_TIPO", "TIPO IN ('CONSULTA')");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Pet", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<int?>("Idade")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("IDADE");
+
+                    b.Property<string>("Nome")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("NOME");
+
+                    b.Property<decimal?>("Peso")
+                        .HasColumnType("DECIMAL(18, 2)")
+                        .HasColumnName("PESO");
+
+                    b.Property<string>("Raca")
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("RACA");
+
+                    b.Property<int>("ResponsavelId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("RESPONSAVEL_ID");
+
+                    b.Property<string>("Sexo")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("NVARCHAR2(20)")
+                        .HasColumnName("SEXO_PET");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ResponsavelId");
+
+                    b.ToTable("YP_T_PETS", t =>
+                        {
+                            t.HasCheckConstraint("CK_PET_SEXO", "SEXO_PET IN ('MACHO','FEMEA')");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Responsavel", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(150)
+                        .HasColumnType("NVARCHAR2(150)")
+                        .HasColumnName("EMAIL");
+
+                    b.Property<string>("Nome")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("NOME");
+
+                    b.Property<string>("Telefone")
+                        .HasMaxLength(20)
+                        .HasColumnType("NVARCHAR2(20)")
+                        .HasColumnName("TELEFONE");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Email")
+                        .IsUnique()
+                        .HasDatabaseName("UQ_RESPONSAVEL_EMAIL");
+
+                    b.ToTable("YP_T_RESPONSAVEIS");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Usuario", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<bool>("Ativo")
+                        .HasColumnType("NUMBER(1)")
+                        .HasColumnName("ATIVO");
+
+                    b.Property<DateTime>("CriadoEm")
+                        .HasColumnType("TIMESTAMP(7)")
+                        .HasColumnName("CRIADO_EM");
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(150)
+                        .HasColumnType("NVARCHAR2(150)")
+                        .HasColumnName("EMAIL");
+
+                    b.Property<string>("Perfil")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("NVARCHAR2(20)")
+                        .HasColumnName("PERFIL");
+
+                    b.Property<int?>("ResponsavelId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("RESPONSAVEL_ID");
+
+                    b.Property<string>("SenhaHash")
+                        .IsRequired()
+                        .HasMaxLength(255)
+                        .HasColumnType("NVARCHAR2(255)")
+                        .HasColumnName("SENHA_HASH");
+
+                    b.Property<int?>("VeterinarioId")
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("VETERINARIO_ID");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Email")
+                        .IsUnique()
+                        .HasDatabaseName("UK_USUARIO_EMAIL");
+
+                    b.HasIndex("ResponsavelId")
+                        .IsUnique()
+                        .HasDatabaseName("UK_USUARIO_RESPONSAVEL");
+
+                    b.HasIndex("VeterinarioId")
+                        .IsUnique()
+                        .HasDatabaseName("UK_USUARIO_VETERINARIO");
+
+                    b.ToTable("YP_T_USUARIOS", t =>
+                        {
+                            t.HasCheckConstraint("CK_USUARIO_PERFIL", "PERFIL IN ('RESPONSAVEL','VETERINARIO','ADMIN')");
+
+                            t.HasCheckConstraint("CK_USUARIO_VINCULO", "(PERFIL = 'RESPONSAVEL' AND RESPONSAVEL_ID IS NOT NULL AND VETERINARIO_ID IS NULL) OR (PERFIL = 'VETERINARIO' AND VETERINARIO_ID IS NOT NULL AND RESPONSAVEL_ID IS NULL) OR (PERFIL = 'ADMIN' AND RESPONSAVEL_ID IS NULL AND VETERINARIO_ID IS NULL)");
+                        });
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Veterinario", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("NUMBER(10)")
+                        .HasColumnName("ID");
+
+                    OraclePropertyBuilderExtensions.UseIdentityColumn(b.Property<int>("Id"));
+
+                    b.Property<string>("Crmv")
+                        .IsRequired()
+                        .HasMaxLength(30)
+                        .HasColumnType("NVARCHAR2(30)")
+                        .HasColumnName("CRMV");
+
+                    b.Property<string>("Email")
+                        .IsRequired()
+                        .HasMaxLength(150)
+                        .HasColumnType("NVARCHAR2(150)")
+                        .HasColumnName("EMAIL");
+
+                    b.Property<string>("Especialidade")
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("ESPECIALIDADE");
+
+                    b.Property<string>("Nome")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("NVARCHAR2(100)")
+                        .HasColumnName("NOME");
+
+                    b.Property<string>("Telefone")
+                        .HasMaxLength(20)
+                        .HasColumnType("NVARCHAR2(20)")
+                        .HasColumnName("TELEFONE");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Crmv")
+                        .IsUnique()
+                        .HasDatabaseName("UQ_VETERINARIO_CRMV");
+
+                    b.HasIndex("Email")
+                        .IsUnique()
+                        .HasDatabaseName("UQ_VETERINARIO_EMAIL");
+
+                    b.ToTable("YP_T_VETERINARIOS");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Consulta", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Pet", "Pet")
+                        .WithMany("Consultas")
+                        .HasForeignKey("PetId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("YourPetHealth.Models.Veterinario", "Veterinario")
+                        .WithMany("Consultas")
+                        .HasForeignKey("VeterinarioId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Pet");
+
+                    b.Navigation("Veterinario");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.HistoricoClinico", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Pet", "Pet")
+                        .WithMany("Historicos")
+                        .HasForeignKey("PetId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Pet");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Pet", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Responsavel", "Responsavel")
+                        .WithMany("Pets")
+                        .HasForeignKey("ResponsavelId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.Navigation("Responsavel");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Usuario", b =>
+                {
+                    b.HasOne("YourPetHealth.Models.Responsavel", "Responsavel")
+                        .WithOne("Usuario")
+                        .HasForeignKey("YourPetHealth.Models.Usuario", "ResponsavelId")
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    b.HasOne("YourPetHealth.Models.Veterinario", "Veterinario")
+                        .WithOne("Usuario")
+                        .HasForeignKey("YourPetHealth.Models.Usuario", "VeterinarioId")
+                        .OnDelete(DeleteBehavior.Cascade);
+
+                    b.Navigation("Responsavel");
+
+                    b.Navigation("Veterinario");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Pet", b =>
+                {
+                    b.Navigation("Consultas");
+
+                    b.Navigation("Historicos");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Responsavel", b =>
+                {
+                    b.Navigation("Pets");
+
+                    b.Navigation("Usuario");
+                });
+
+            modelBuilder.Entity("YourPetHealth.Models.Veterinario", b =>
+                {
+                    b.Navigation("Consultas");
+
+                    b.Navigation("Usuario");
+                });
+#pragma warning restore 612, 618
+        }
+    }
+}
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace YourPetHealth.Models
+{
+    [Table("YP_T_CONSULTAS")]
+    public class Consulta
+    {
+        [Key]
+        [Column("ID")]
+        public int Id { get; set; }
+
+        [Required]
+        [Column("PET_ID")]
+        public int PetId { get; set; }
+
+        [Required]
+        [Column("VETERINARIO_ID")]
+        public int VeterinarioId { get; set; }
+
+        [Required(ErrorMessage = "Tipo Ã© obrigatÃ³rio")]
+        [Column("TIPO")]
+        [MaxLength(100)]
+        public string Tipo { get; set; } = string.Empty;
+
+        [Column("DESCRICAO")]
+        [MaxLength(1000)]
+        public string? Descricao { get; set; }
+
+        [Required(ErrorMessage = "Data Ã© obrigatÃ³ria")]
+        [Column("DATA")]
+        public DateTime Data { get; set; }
+
+        [Column("OBSERVACOES")]
+        [MaxLength(1000)]
+        public string? Observacoes { get; set; }
+
+        [Required]
+        [Column("STATUS")]
+        [MaxLength(30)]
+        public string Status { get; set; } = "AGENDADA";
+
+        [ForeignKey("PetId")]
+        public Pet? Pet { get; set; }
+
+        [ForeignKey("VeterinarioId")]
+        public Veterinario? Veterinario { get; set; }
+    }
+}
+namespace YourPetHealth_.Models
+{
+    public class ErrorViewModel
+    {
+        public string? RequestId { get; set; }
+
+        public bool ShowRequestId => !string.IsNullOrEmpty(RequestId);
+    }
+}
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace YourPetHealth.Models
+{
+    [Table("YP_T_HISTORICO_CLINICO")]
+    public class HistoricoClinico
+    {
+        [Key]
+        [Column("ID")]
+        public int Id { get; set; }
+
+        [Required]
+        [Column("PET_ID")]
+        public int PetId { get; set; }
+
+        [Required]
+        [Column("TIPO")]
+        [MaxLength(50)]
+        public string Tipo { get; set; } = "CONSULTA";
+
+        [Column("DESCRICAO")]
+        [MaxLength(1000)]
+        public string? Descricao { get; set; }
+
+        [Required]
+        [Column("DATA")]
+        public DateTime Data { get; set; }
+
+        [ForeignKey("PetId")]
+        public Pet? Pet { get; set; }
+    }
+}
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace YourPetHealth.Models
+{
+    [Table("YP_T_PETS")]
+    public class Pet
+    {
+        [Key]
+        [Column("ID")]
+        public int Id { get; set; }
+
+        [Required]
+        [Column("RESPONSAVEL_ID")]
+        public int ResponsavelId { get; set; }
+
+        [Required(ErrorMessage = "Nome Ã© obrigatÃ³rio")]
+        [Column("NOME")]
+        [MaxLength(100)]
+        public string Nome { get; set; } = string.Empty;
+
+        [Column("RACA")]
+        [MaxLength(100)]
+        public string? Raca { get; set; }
+
+        [Column("IDADE")]
+        public int? Idade { get; set; }
+
+        [Column("PESO")]
+        public decimal? Peso { get; set; }
+
+        [Required(ErrorMessage = "Sexo Ã© obrigatÃ³rio")]
+        [Column("SEXO_PET")]
+        [MaxLength(20)]
+        public string Sexo { get; set; } = string.Empty;
+
+        [ForeignKey("ResponsavelId")]
+        public Responsavel? Responsavel { get; set; }
+
+        public ICollection<Consulta> Consultas { get; set; } = new List<Consulta>();
+        public ICollection<HistoricoClinico> Historicos { get; set; } = new List<HistoricoClinico>();
+    }
+}
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace YourPetHealth.Models
+{
+    [Table("YP_T_RESPONSAVEIS")]
+    public class Responsavel
+    {
+        [Key]
+        [Column("ID")]
+        public int Id { get; set; }
+
+        [Required(ErrorMessage = "Nome Ã© obrigatÃ³rio")]
+        [Column("NOME")]
+        [MaxLength(100)]
+        public string Nome { get; set; } = string.Empty;
+
+        [Required(ErrorMessage = "Email Ã© obrigatÃ³rio")]
+        [Column("EMAIL")]
+        [MaxLength(150)]
+        public string Email { get; set; } = string.Empty;
+
+        [Column("TELEFONE")]
+        [MaxLength(20)]
+        public string? Telefone { get; set; }
+
+        [NotMapped]
+        [DataType(DataType.Password)]
+        public string? Senha { get; set; }
+
+        public ICollection<Pet> Pets { get; set; } = new List<Pet>();
+
+        public Usuario? Usuario { get; set; }
+    }
+}
+using MongoDB.Bson;
+using MongoDB.Bson.Serialization.Attributes;
+
+namespace YourPetHealth.Models
+{
+    public class TelemetriaPet
+    {
+        [BsonId]
+        [BsonRepresentation(BsonType.ObjectId)]
+        public string Id { get; set; }
+
+        public int PetId { get; set; }
+
+        public double BatimentosCardiacos { get; set; }
+
+        public double Temperatura { get; set; }
+
+        public string StatusGeral { get; set; } = string.Empty;
+
+        public DateTime DataLeitura { get; set; } = DateTime.UtcNow;
+    }
+}
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace YourPetHealth.Models
+{
+    [Table("YP_T_USUARIOS")]
+    public class Usuario
+    {
+        [Key]
+        [Column("ID")]
+        public int Id { get; set; }
+
+        [Required(ErrorMessage = "Email Ã© obrigatÃ³rio")]
+        [EmailAddress]
+        [Column("EMAIL")]
+        [MaxLength(150)]
+        public string Email { get; set; } = string.Empty;
+
+        [Required]
+        [Column("SENHA_HASH")]
+        [MaxLength(255)]
+        public string SenhaHash { get; set; } = string.Empty;
+
+        [Required]
+        [Column("PERFIL")]
+        [MaxLength(20)]
+        public string Perfil { get; set; } = string.Empty;
+
+        [Column("ATIVO")]
+        public bool Ativo { get; set; } = true;
+
+        [Column("CRIADO_EM")]
+        public DateTime CriadoEm { get; set; } = DateTime.UtcNow;
+
+        [Column("RESPONSAVEL_ID")]
+        public int? ResponsavelId { get; set; }
+
+        [Column("VETERINARIO_ID")]
+        public int? VeterinarioId { get; set; }
+
+        [ForeignKey("ResponsavelId")]
+        public Responsavel? Responsavel { get; set; }
+
+        [ForeignKey("VeterinarioId")]
+        public Veterinario? Veterinario { get; set; }
+    }
+
+    public static class PerfilUsuario
+    {
+        public const string Responsavel = "RESPONSAVEL";
+        public const string Veterinario = "VETERINARIO";
+        public const string Admin = "ADMIN";
+    }
+}
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace YourPetHealth.Models
+{
+    [Table("YP_T_VETERINARIOS")]
+    public class Veterinario
+    {
+        [Key]
+        [Column("ID")]
+        public int Id { get; set; }
+
+        [Required(ErrorMessage = "Nome Ã© obrigatÃ³rio")]
+        [Column("NOME")]
+        [MaxLength(100)]
+        public string Nome { get; set; } = string.Empty;
+
+        [Required(ErrorMessage = "Email Ã© obrigatÃ³rio")]
+        [Column("EMAIL")]
+        [MaxLength(150)]
+        public string Email { get; set; } = string.Empty;
+
+        [Column("TELEFONE")]
+        [MaxLength(20)]
+        public string? Telefone { get; set; }
+
+        [Required(ErrorMessage = "CRMV Ã© obrigatÃ³rio")]
+        [Column("CRMV")]
+        [MaxLength(30)]
+        public string Crmv { get; set; } = string.Empty;
+
+        [Column("ESPECIALIDADE")]
+        [MaxLength(100)]
+        public string? Especialidade { get; set; }
+
+        [NotMapped]
+        [DataType(DataType.Password)]
+        public string? Senha { get; set; }
+
+        public ICollection<Consulta> Consultas { get; set; } = new List<Consulta>();
+
+        public Usuario? Usuario { get; set; }
+    }
+}
+using Microsoft.Extensions.Configuration;
+using MongoDB.Driver;
+
+namespace YourPetHealth.Services
+{
+    public class MongoDbService
+    {
+        private readonly IMongoDatabase _database;
+
+        public MongoDbService(IConfiguration configuration)
+        {
+           
+            var connectionString = configuration["MongoDbSettings:ConnectionString"] ?? "mongodb://localhost:27017";
+            var databaseName = configuration["MongoDbSettings:DatabaseName"] ?? "clyvo_vet_db";
+
+            var client = new MongoClient(connectionString);
+            _database = client.GetDatabase(databaseName);
+        }
+
+        public IMongoCollection<T> GetCollection<T>(string name)
+        {
+            return _database.GetCollection<T>(name);
+        }
+    }
+}
+
+
+

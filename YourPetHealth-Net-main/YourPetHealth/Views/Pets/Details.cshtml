@@ -1,0 +1,61 @@
+@model YourPetHealth.Models.Pet
+
+@{
+    ViewData["Title"] = Model.Nome;
+}
+
+<div class="crumb">
+    <a asp-action="Index">Pets</a>
+    <span class="sep">/</span>
+    <span>@Model.Nome</span>
+</div>
+
+<div class="page-header">
+    <div>
+        <h1 class="page-title"><i class="fa-solid fa-paw"></i> @Model.Nome</h1>
+        <p class="page-subtitle">Detalhes do pet</p>
+    </div>
+    <div class="page-actions">
+        <a asp-action="Edit" asp-route-id="@Model.Id" class="btn btn-primary">
+            <i class="fa-solid fa-pen"></i> Editar
+        </a>
+        <a asp-action="Index" class="btn btn-secondary">Voltar</a>
+    </div>
+</div>
+
+<div class="card card-soft mb-4">
+    <div class="detail-grid">
+        <div class="detail-item">
+            <div class="label">Raça</div>
+            <div class="value">@Model.Raca</div>
+        </div>
+        <div class="detail-item">
+            <div class="label">Idade</div>
+            <div class="value">@Model.Idade anos</div>
+        </div>
+        <div class="detail-item">
+            <div class="label">Peso</div>
+            <div class="value">@(Model.Peso?.ToString("0.##") ?? "—") kg</div>
+        </div>
+        <div class="detail-item">
+            <div class="label">Sexo</div>
+            <div class="value"><span class="badge badge-sexo">@Model.Sexo</span></div>
+        </div>
+        @if (Model.Responsavel != null)
+        {
+            <div class="detail-item">
+                <div class="label">Tutor</div>
+                <div class="value">@Model.Responsavel.Nome</div>
+            </div>
+        }
+    </div>
+</div>
+
+<div class="page-actions">
+    @if (User.IsInRole("RESPONSAVEL") || User.IsInRole("ADMIN"))
+    {
+        <a asp-action="Delete" asp-route-id="@Model.Id" class="btn btn-danger-soft">
+            <i class="fa-solid fa-trash"></i> Remover este pet
+        </a>
+    }
+</div>

@@ -1,0 +1,31 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "YourPetHealth", "YourPetHealth\YourPetHealth.csproj", "{87D5154E-BBE0-43E6-A8F3-C7CAD327AF7A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "YourPetHealth.Tests.Unit", "YourPetHealth.Tests.Unit\YourPetHealth.Tests.Unit.csproj", "{7532432F-3E5A-45F7-BC7F-89ED1FC3D1D1}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "YourPetHealth.Tests.Integration", "YourPetHealth.Tests.Integration\YourPetHealth.Tests.Integration.csproj", "{1104FC85-F085-47EA-999F-ED9E4B916A15}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{87D5154E-BBE0-43E6-A8F3-C7CAD327AF7A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{87D5154E-BBE0-43E6-A8F3-C7CAD327AF7A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{87D5154E-BBE0-43E6-A8F3-C7CAD327AF7A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{87D5154E-BBE0-43E6-A8F3-C7CAD327AF7A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7532432F-3E5A-45F7-BC7F-89ED1FC3D1D1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7532432F-3E5A-45F7-BC7F-89ED1FC3D1D1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7532432F-3E5A-45F7-BC7F-89ED1FC3D1D1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7532432F-3E5A-45F7-BC7F-89ED1FC3D1D1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1104FC85-F085-47EA-999F-ED9E4B916A15}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1104FC85-F085-47EA-999F-ED9E4B916A15}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1104FC85-F085-47EA-999F-ED9E4B916A15}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1104FC85-F085-47EA-999F-ED9E4B916A15}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

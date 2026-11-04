@@ -1,0 +1,77 @@
+@model YourPetHealth.Models.Consulta
+
+@{
+    ViewData["Title"] = "Agendar consulta";
+}
+
+<div class="crumb">
+    <a asp-action="Index">Consultas</a>
+    <span class="sep">/</span>
+    <span>Agendar</span>
+</div>
+
+<div class="form-shell">
+    <div class="form-card-header">
+        <h1><i class="fa-solid fa-calendar-plus"></i> Agendar consulta</h1>
+        <p>Escolha o pet, o veterinário e o horário</p>
+    </div>
+
+    <div class="form-panel">
+        <form asp-action="Create" method="post">
+            <div asp-validation-summary="ModelOnly" class="text-danger mb-3"></div>
+
+            <div class="form-group">
+                <label asp-for="PetId">Pet</label>
+                <select asp-for="PetId" asp-items="ViewBag.PetId" class="form-select">
+                    <option value="">Selecione...</option>
+                </select>
+                <span asp-validation-for="PetId" class="text-danger small"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="VeterinarioId">Veterinário</label>
+                <select asp-for="VeterinarioId" asp-items="ViewBag.VeterinarioId" class="form-select">
+                    <option value="">Selecione...</option>
+                </select>
+                <span asp-validation-for="VeterinarioId" class="text-danger small"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="Tipo">Tipo de consulta</label>
+                <select asp-for="Tipo" class="form-select">
+                    <option value="">Selecione</option>
+                    <option value="ROTINA">ROTINA</option>
+                    <option value="VACINACAO">VACINACAO</option>
+                    <option value="EMERGENCIA">EMERGENCIA</option>
+                    <option value="RETORNO">RETORNO</option>
+                    <option value="EXAME">EXAME</option>
+                </select>
+                <span asp-validation-for="Tipo" class="text-danger small"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="Data">Data e hora</label>
+                <input asp-for="Data" type="datetime-local" class="form-control" />
+                <span class="form-hint">Atendimento de segunda a sábado, das 08:00 às 18:00.</span>
+                <span asp-validation-for="Data" class="text-danger small"></span>
+            </div>
+
+            <div class="form-group">
+                <label asp-for="Descricao">Motivo da consulta</label>
+                <textarea asp-for="Descricao" rows="3" class="form-control" placeholder="Ex: Check-up semestral"></textarea>
+                <span asp-validation-for="Descricao" class="text-danger small"></span>
+            </div>
+
+            <div class="form-actions">
+                <button type="submit" class="btn btn-primary">
+                    <i class="fa-solid fa-check"></i> Agendar consulta
+                </button>
+                <a asp-action="Index" class="btn btn-secondary">Cancelar</a>
+            </div>
+        </form>
+    </div>
+</div>
+
+@section Scripts {
+    <partial name="_ValidationScriptsPartial" />
+}

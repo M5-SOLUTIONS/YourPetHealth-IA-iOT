@@ -1,0 +1,50 @@
+@model YourPetHealth.Models.Responsavel
+
+@{
+    ViewData["Title"] = "Excluir responsável";
+}
+
+<div class="crumb">
+    <a asp-action="Index">Responsáveis</a>
+    <span class="sep">/</span>
+    <span>Excluir</span>
+</div>
+
+<div class="form-shell">
+    <div class="form-card-header">
+        <h1><i class="fa-solid fa-trash"></i> Excluir responsável</h1>
+        <p>Confirme se deseja remover este tutor</p>
+    </div>
+
+    <div class="form-panel">
+        <div class="alert alert-danger mb-4">
+            <i class="fa-solid fa-triangle-exclamation me-1"></i>
+            <strong>Atenção:</strong> esta ação não pode ser desfeita.
+        </div>
+
+        <div class="detail-grid mb-4">
+            <div class="detail-item">
+                <div class="label">Nome</div>
+                <div class="value">@Model.Nome</div>
+            </div>
+            <div class="detail-item">
+                <div class="label">E-mail</div>
+                <div class="value">@Model.Email</div>
+            </div>
+            <div class="detail-item">
+                <div class="label">Telefone</div>
+                <div class="value">@(Model.Telefone ?? "—")</div>
+            </div>
+        </div>
+
+        <form asp-action="Delete" method="post">
+            <input type="hidden" asp-for="Id" />
+            <div class="form-actions">
+                <button type="submit" class="btn btn-danger-soft">
+                    <i class="fa-solid fa-trash"></i> Sim, excluir
+                </button>
+                <a asp-action="Index" class="btn btn-secondary">Cancelar</a>
+            </div>
+        </form>
+    </div>
+</div>
